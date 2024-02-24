@@ -7,11 +7,12 @@ use base64::Engine;
 use ecow::{eco_format, EcoString};
 use ttf_parser::{GlyphId, OutlineBuilder};
 use typst::foundations::Repr;
+use typst::introspection::Meta;
 use typst::layout::{
     Abs, Angle, Axes, Frame, FrameItem, FrameKind, GroupItem, Point, Quadrant, Ratio,
     Size, Transform,
 };
-use typst::model::Document;
+use typst::model::{Destination, Document};
 use typst::text::{Font, TextItem};
 use typst::util::hash128;
 use typst::visualize::{
@@ -278,8 +279,33 @@ impl SVGRenderer {
             self.xml.write_attribute("transform", &SvgMatrix(ts));
         }
 
+        //if any of the frame items is a link, write the morphtag to the g element
+        for (_pos, item) in frame.items() {
+            match item {
+                FrameItem::Meta(meta, _size) => match meta {
+                    Meta::Link(dest) => {
+                        if let Destination::Url(url) = dest {
+                            //write the morphtag to the current element or parent element
+                            self.xml.write_attribute("morphtag", url);
+
+                            //once one is found, skip the rest
+                            break;
+                        }
+                    },
+                    Meta::Elem(_) => continue,
+                    Meta::Hide => continue,
+                },
+                FrameItem::Group(_) => continue,
+                FrameItem::Text(_) => continue,
+                FrameItem::Shape(_, _) => continue,
+                FrameItem::Image(_, _, _) => continue,
+            };
+        }
+
+
+
         for (pos, item) in frame.items() {
-            // File size optimization
+            // File size optimization (we do not need metadata in the svg file and the morphtag/links are added above)
             if matches!(item, FrameItem::Meta(_, _)) {
                 continue;
             }

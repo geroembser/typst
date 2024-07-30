@@ -2,13 +2,14 @@ use std::cmp::Ordering;
 use std::fmt::{self, Debug, Formatter};
 use std::ops::{Add, Div, Mul, Neg};
 
+use comemo::Tracked;
 use ecow::{eco_format, EcoString};
 
-use crate::diag::{At, Hint, SourceResult};
-use crate::foundations::{func, scope, ty, Fold, Repr, Resolve, StyleChain, Styles};
+use crate::diag::{At, Hint, HintedStrResult, SourceResult};
+use crate::foundations::{func, scope, ty, Context, Fold, Repr, Resolve, StyleChain};
 use crate::layout::{Abs, Em};
 use crate::syntax::Span;
-use crate::util::Numeric;
+use crate::utils::Numeric;
 
 /// A size or distance, possibly expressed with contextual units.
 ///
@@ -37,7 +38,7 @@ use crate::util::Numeric;
 /// # Fields
 /// - `abs`: A length with just the absolute component of the current length
 ///   (that is, excluding the `em` component).
-/// - `em`: The amount of `em` units in this length, as a [float]($float).
+/// - `em`: The amount of `em` units in this length, as a [float].
 #[ty(scope, cast)]
 #[derive(Default, Copy, Clone, Eq, PartialEq, Hash)]
 pub struct Length {
@@ -137,32 +138,22 @@ impl Length {
     ///
     /// ```example
     /// #set text(size: 12pt)
-    /// #style(styles => [
-    ///   #(6pt).to-absolute(styles) \
-    ///   #(6pt + 10em).to-absolute(styles) \
-    ///   #(10em).to-absolute(styles)
-    /// ])
+    /// #context [
+    ///   #(6pt).to-absolute() \
+    ///   #(6pt + 10em).to-absolute() \
+    ///   #(10em).to-absolute()
+    /// ]
     ///
     /// #set text(size: 6pt)
-    /// #style(styles => [
-    ///   #(6pt).to-absolute(styles) \
-    ///   #(6pt + 10em).to-absolute(styles) \
-    ///   #(10em).to-absolute(styles)
-    /// ])
+    /// #context [
+    ///   #(6pt).to-absolute() \
+    ///   #(6pt + 10em).to-absolute() \
+    ///   #(10em).to-absolute()
+    /// ]
     /// ```
     #[func]
-    pub fn to_absolute(
-        &self,
-        /// The styles to resolve the length with.
-        ///
-        /// Since a length can use font-relative em units, resolving it to an
-        /// absolute length requires knowledge of the font size. This size is
-        /// provided through these styles. You can obtain the styles using
-        /// the [`style`]($style) function.
-        styles: Styles,
-    ) -> Length {
-        let styles = StyleChain::new(&styles);
-        self.resolve(styles).into()
+    pub fn to_absolute(&self, context: Tracked<Context>) -> HintedStrResult<Length> {
+        Ok(self.resolve(context.styles()?).into())
     }
 }
 
@@ -236,7 +227,7 @@ impl Add for Length {
     }
 }
 
-sub_impl!(Length - Length -> Length);
+typst_utils::sub_impl!(Length - Length -> Length);
 
 impl Mul<f64> for Length {
     type Output = Self;
@@ -262,10 +253,10 @@ impl Div<f64> for Length {
     }
 }
 
-assign_impl!(Length += Length);
-assign_impl!(Length -= Length);
-assign_impl!(Length *= f64);
-assign_impl!(Length /= f64);
+typst_utils::assign_impl!(Length += Length);
+typst_utils::assign_impl!(Length -= Length);
+typst_utils::assign_impl!(Length *= f64);
+typst_utils::assign_impl!(Length /= f64);
 
 impl Resolve for Length {
     type Output = Abs;

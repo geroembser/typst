@@ -1,23 +1,20 @@
 use std::any::{Any, TypeId};
 use std::sync::Arc;
 
+use comemo::Tracked;
 use ecow::{eco_format, EcoString, EcoVec};
 use smallvec::SmallVec;
 
-use crate::diag::{bail, StrResult};
+use crate::diag::{bail, HintedStrResult, StrResult};
 use crate::foundations::{
-    cast, func, repr, scope, ty, CastInfo, Content, Dict, Element, FromValue, Func,
-    Label, Reflect, Regex, Repr, Str, StyleChain, Type, Value,
+    cast, func, repr, scope, ty, CastInfo, Content, Context, Dict, Element, FromValue,
+    Func, Label, Reflect, Regex, Repr, Str, StyleChain, Type, Value,
 };
-use crate::introspection::{Locatable, Location};
+use crate::introspection::{Introspector, Locatable, Location};
 use crate::symbols::Symbol;
 use crate::text::TextElem;
 
 /// A helper macro to create a field selector used in [`Selector::Elem`]
-///
-/// ```ignore
-/// select_where!(SequenceElem, Children => vec![]);
-/// ```
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __select_where {
@@ -43,34 +40,32 @@ pub use crate::__select_where as select_where;
 /// A filter for selecting elements within the document.
 ///
 /// You can construct a selector in the following ways:
-/// - you can use an element [function]($function)
+/// - you can use an element [function]
 /// - you can filter for an element function with
 ///   [specific fields]($function.where)
 /// - you can use a [string]($str) or [regular expression]($regex)
 /// - you can use a [`{<label>}`]($label)
-/// - you can use a [`location`]($location)
-/// - call the [`selector`]($selector) constructor to convert any of the above
-///   types into a selector value and use the methods below to refine it
+/// - you can use a [`location`]
+/// - call the [`selector`] constructor to convert any of the above types into a
+///   selector value and use the methods below to refine it
 ///
 /// Selectors are used to [apply styling rules]($styling/#show-rules) to
-/// elements. You can also use selectors to [query]($query) the document for
-/// certain types of elements.
+/// elements. You can also use selectors to [query] the document for certain
+/// types of elements.
 ///
 /// Furthermore, you can pass a selector to several of Typst's built-in
-/// functions to configure their behaviour. One such example is the
-/// [outline]($outline) where it can be used to change which elements are listed
-/// within the outline.
+/// functions to configure their behaviour. One such example is the [outline]
+/// where it can be used to change which elements are listed within the outline.
 ///
 /// Multiple selectors can be combined using the methods shown below. However,
 /// not all kinds of selectors are supported in all places, at the moment.
 ///
 /// # Example
 /// ```example
-/// #locate(loc => query(
+/// #context query(
 ///   heading.where(level: 1)
-///     .or(heading.where(level: 2)),
-///   loc,
-/// ))
+///     .or(heading.where(level: 2))
+/// )
 ///
 /// = This will be found
 /// == So will this
@@ -131,16 +126,15 @@ impl Selector {
     pub fn matches(&self, target: &Content, styles: Option<StyleChain>) -> bool {
         match self {
             Self::Elem(element, dict) => {
-                // TODO: Optimize field access to not clone.
                 target.func() == *element
                     && dict.iter().flat_map(|dict| dict.iter()).all(|(id, value)| {
-                        target.get(*id, styles).as_ref() == Some(value)
+                        target.get(*id, styles).as_ref().ok() == Some(value)
                     })
             }
             Self::Label(label) => target.label() == Some(*label),
             Self::Regex(regex) => target
                 .to_packed::<TextElem>()
-                .map_or(false, |elem| regex.is_match(elem.text())),
+                .is_some_and(|elem| regex.is_match(elem.text())),
             Self::Can(cap) => target.func().can_type_id(*cap),
             Self::Or(selectors) => {
                 selectors.iter().any(move |sel| sel.matches(target, styles))
@@ -181,7 +175,7 @@ impl Selector {
         Self::Or(others.into_iter().chain(Some(self)).collect())
     }
 
-    /// Selects all elements that match this and all of the the other selectors.
+    /// Selects all elements that match this and all of the other selectors.
     #[func]
     pub fn and(
         self,
@@ -283,12 +277,12 @@ impl Repr for Selector {
 
 cast! {
     type Selector,
+    text: EcoString => Self::text(&text)?,
     func: Func => func
         .element()
         .ok_or("only element functions can be used as selectors")?
         .select(),
     label: Label => Self::Label(label),
-    text: EcoString => Self::text(&text)?,
     regex: Regex => Self::regex(regex)?,
     location: Location => Self::Location(location),
 }
@@ -300,11 +294,29 @@ cast! {
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct LocatableSelector(pub Selector);
 
+impl LocatableSelector {
+    /// Resolve this selector into a location that is guaranteed to be unique.
+    pub fn resolve_unique(
+        &self,
+        introspector: Tracked<Introspector>,
+        context: Tracked<Context>,
+    ) -> HintedStrResult<Location> {
+        match &self.0 {
+            Selector::Location(loc) => Ok(*loc),
+            other => {
+                context.introspect()?;
+                Ok(introspector.query_unique(other).map(|c| c.location().unwrap())?)
+            }
+        }
+    }
+}
+
 impl Reflect for LocatableSelector {
     fn input() -> CastInfo {
         CastInfo::Union(vec![
             CastInfo::Type(Type::of::<Label>()),
             CastInfo::Type(Type::of::<Func>()),
+            CastInfo::Type(Type::of::<Location>()),
             CastInfo::Type(Type::of::<Selector>()),
         ])
     }
@@ -314,7 +326,10 @@ impl Reflect for LocatableSelector {
     }
 
     fn castable(value: &Value) -> bool {
-        Label::castable(value) || Func::castable(value) || Selector::castable(value)
+        Label::castable(value)
+            || Func::castable(value)
+            || Location::castable(value)
+            || Selector::castable(value)
     }
 }
 
@@ -324,7 +339,7 @@ cast! {
 }
 
 impl FromValue for LocatableSelector {
-    fn from_value(value: Value) -> StrResult<Self> {
+    fn from_value(value: Value) -> HintedStrResult<Self> {
         fn validate(selector: &Selector) -> StrResult<()> {
             match selector {
                 Selector::Elem(elem, _) => {
@@ -406,8 +421,8 @@ cast! {
 }
 
 impl FromValue for ShowableSelector {
-    fn from_value(value: Value) -> StrResult<Self> {
-        fn validate(selector: &Selector, nested: bool) -> StrResult<()> {
+    fn from_value(value: Value) -> HintedStrResult<Self> {
+        fn validate(selector: &Selector, nested: bool) -> HintedStrResult<()> {
             match selector {
                 Selector::Elem(_, _) => {}
                 Selector::Label(_) => {}

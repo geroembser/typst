@@ -11,7 +11,7 @@ use crate::introspection::{Count, Counter, CounterUpdate, Locatable, Location};
 use crate::layout::{Abs, Em, HElem, Length, Ratio};
 use crate::model::{Destination, Numbering, NumberingPattern, ParElem};
 use crate::text::{SuperElem, TextElem, TextSize};
-use crate::util::NonZeroExt;
+use crate::utils::NonZeroExt;
 use crate::visualize::{LineElem, Stroke};
 
 /// A footnote.
@@ -23,9 +23,9 @@ use crate::visualize::{LineElem, Stroke};
 ///
 /// To customize the appearance of the entry in the footnote listing, see
 /// [`footnote.entry`]($footnote.entry). The footnote itself is realized as a
-/// normal superscript, so you can use a set rule on the [`super`]($super)
-/// function to customize it. You can also apply a show rule to customize
-/// only the footnote marker (superscript number) in the running text.
+/// normal superscript, so you can use a set rule on the [`super`] function to
+/// customize it. You can also apply a show rule to customize only the footnote
+/// marker (superscript number) in the running text.
 ///
 /// # Example
 /// ```example
@@ -56,8 +56,8 @@ pub struct FootnoteElem {
     ///
     /// By default, the footnote numbering continues throughout your document.
     /// If you prefer per-page footnote numbering, you can reset the footnote
-    /// [counter]($counter) in the page [header]($page.header). In the future,
-    /// there might be a simpler way to achieve this.
+    /// [counter] in the page [header]($page.header). In the future, there might
+    /// be a simpler way to achieve this.
     ///
     /// ```example
     /// #set footnote(numbering: "*")
@@ -93,6 +93,15 @@ impl FootnoteElem {
         Self::new(FootnoteBody::Reference(label))
     }
 
+    /// Creates a new footnote referencing the footnote with the specified label,
+    /// with the other fields from the current footnote cloned.
+    pub fn into_ref(&self, label: Label) -> Self {
+        Self {
+            body: FootnoteBody::Reference(label),
+            ..self.clone()
+        }
+    }
+
     /// Tests if this footnote is a reference to another footnote.
     pub fn is_ref(&self) -> bool {
         matches!(self.body(), FootnoteBody::Reference(_))
@@ -126,11 +135,12 @@ impl Packed<FootnoteElem> {
 impl Show for Packed<FootnoteElem> {
     #[typst_macros::time(name = "footnote", span = self.span())]
     fn show(&self, engine: &mut Engine, styles: StyleChain) -> SourceResult<Content> {
-        let loc = self.declaration_location(engine).at(self.span())?;
+        let span = self.span();
+        let loc = self.declaration_location(engine).at(span)?;
         let numbering = self.numbering(styles);
         let counter = Counter::of(FootnoteElem::elem());
-        let num = counter.at(engine, loc)?.display(engine, numbering)?;
-        let sup = SuperElem::new(num).pack().spanned(self.span());
+        let num = counter.display_at_loc(engine, loc, styles, numbering)?;
+        let sup = SuperElem::new(num).pack().spanned(span);
         let loc = loc.variant(1);
         // Add zero-width weak spacing to make the footnote "sticky".
         Ok(HElem::hole().pack() + sup.linked(Destination::Location(loc)))
@@ -166,11 +176,6 @@ cast! {
 /// This function is not intended to be called directly. Instead, it is used
 /// in set and show rules to customize footnote listings.
 ///
-/// _Note:_ Set and show rules for `footnote.entry` must be defined at the
-/// beginning of the document in order to work correctly.
-/// See [here](https://github.com/typst/typst/issues/1348#issuecomment-1566316463)
-/// for more information.
-///
 /// ```example
 /// #show footnote.entry: set text(red)
 ///
@@ -178,6 +183,12 @@ cast! {
 /// #footnote[It's down here]
 /// has red text!
 /// ```
+///
+/// _Note:_ Set and show rules for `footnote.entry` must be defined at the
+/// beginning of the document in order to work correctly. See [here][issue] for
+/// more information.
+///
+/// [issue]: https://github.com/typst/typst/issues/1467#issuecomment-1588799440
 #[elem(name = "entry", title = "Footnote Entry", Show, ShowSet)]
 pub struct FootnoteEntry {
     /// The footnote for this entry. It's location can be used to determine
@@ -266,6 +277,7 @@ pub struct FootnoteEntry {
 impl Show for Packed<FootnoteEntry> {
     #[typst_macros::time(name = "footnote.entry", span = self.span())]
     fn show(&self, engine: &mut Engine, styles: StyleChain) -> SourceResult<Content> {
+        let span = self.span();
         let note = self.note();
         let number_gap = Em::new(0.05);
         let default = StyleChain::default();
@@ -273,17 +285,18 @@ impl Show for Packed<FootnoteEntry> {
         let counter = Counter::of(FootnoteElem::elem());
         let Some(loc) = note.location() else {
             bail!(
-                self.span(), "footnote entry must have a location";
+                span, "footnote entry must have a location";
                 hint: "try using a query or a show rule to customize the footnote instead"
             );
         };
 
-        let num = counter.at(engine, loc)?.display(engine, numbering)?;
+        let num = counter.display_at_loc(engine, loc, styles, numbering)?;
         let sup = SuperElem::new(num)
             .pack()
-            .spanned(self.span())
+            .spanned(span)
             .linked(Destination::Location(loc))
-            .backlinked(loc.variant(1));
+            .located(loc.variant(1));
+
         Ok(Content::sequence([
             HElem::new(self.indent(styles).into()).pack(),
             sup,

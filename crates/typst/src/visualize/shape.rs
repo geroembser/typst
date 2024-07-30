@@ -2,13 +2,16 @@ use std::f64::consts::SQRT_2;
 
 use crate::diag::SourceResult;
 use crate::engine::Engine;
-use crate::foundations::{elem, Content, Packed, Resolve, Smart, StyleChain};
+use crate::foundations::{
+    elem, Cast, Content, NativeElement, Packed, Show, Smart, StyleChain,
+};
+use crate::introspection::Locator;
 use crate::layout::{
-    Abs, Axes, Corner, Corners, Frame, FrameItem, LayoutMultiple, LayoutSingle, Length,
-    Point, Ratio, Regions, Rel, Sides, Size,
+    Abs, Axes, BlockElem, Corner, Corners, Frame, FrameItem, Length, Point, Ratio,
+    Region, Regions, Rel, Sides, Size,
 };
 use crate::syntax::Span;
-use crate::util::Get;
+use crate::utils::Get;
 use crate::visualize::{FixedStroke, Paint, Path, Stroke};
 
 /// A rectangle with optional content.
@@ -24,7 +27,7 @@ use crate::visualize::{FixedStroke, Paint, Path, Stroke};
 ///   to fit the content.
 /// ]
 /// ```
-#[elem(title = "Rectangle", LayoutSingle)]
+#[elem(title = "Rectangle", Show)]
 pub struct RectElem {
     /// The rectangle's width, relative to its parent container.
     pub width: Smart<Rel<Length>>,
@@ -47,7 +50,7 @@ pub struct RectElem {
     /// - `{none}` to disable stroking
     /// - `{auto}` for a stroke of `{1pt + black}` if and if only if no fill is
     ///   given.
-    /// - Any kind of [stroke]($stroke)
+    /// - Any kind of [stroke]
     /// - A dictionary describing the stroke for each side inidvidually. The
     ///   dictionary can contain the following keys in order of precedence:
     ///   - `top`: The top stroke.
@@ -128,31 +131,35 @@ pub struct RectElem {
     /// When this is omitted, the rectangle takes on a default size of at most
     /// `{45pt}` by `{30pt}`.
     #[positional]
+    #[borrowed]
     pub body: Option<Content>,
 }
 
-impl LayoutSingle for Packed<RectElem> {
-    #[typst_macros::time(name = "rect", span = self.span())]
-    fn layout(
-        &self,
-        engine: &mut Engine,
-        styles: StyleChain,
-        regions: Regions,
-    ) -> SourceResult<Frame> {
-        layout(
-            engine,
-            styles,
-            regions,
-            ShapeKind::Rect,
-            &self.body(styles),
-            Axes::new(self.width(styles), self.height(styles)),
-            self.fill(styles),
-            self.stroke(styles),
-            self.inset(styles),
-            self.outset(styles),
-            self.radius(styles),
-            self.span(),
+impl Show for Packed<RectElem> {
+    fn show(&self, _: &mut Engine, styles: StyleChain) -> SourceResult<Content> {
+        Ok(BlockElem::single_layouter(
+            self.clone(),
+            |elem, engine, locator, styles, region| {
+                layout_shape(
+                    engine,
+                    locator,
+                    styles,
+                    region,
+                    ShapeKind::Rect,
+                    elem.body(styles),
+                    elem.fill(styles),
+                    elem.stroke(styles),
+                    elem.inset(styles),
+                    elem.outset(styles),
+                    elem.radius(styles),
+                    elem.span(),
+                )
+            },
         )
+        .with_width(self.width(styles))
+        .with_height(self.height(styles))
+        .pack()
+        .spanned(self.span()))
     }
 }
 
@@ -169,7 +176,7 @@ impl LayoutSingle for Packed<RectElem> {
 ///   sized to fit.
 /// ]
 /// ```
-#[elem(LayoutSingle)]
+#[elem(Show)]
 pub struct SquareElem {
     /// The square's side length. This is mutually exclusive with `width` and
     /// `height`.
@@ -234,31 +241,35 @@ pub struct SquareElem {
     /// When this is omitted, the square takes on a default size of at most
     /// `{30pt}`.
     #[positional]
+    #[borrowed]
     pub body: Option<Content>,
 }
 
-impl LayoutSingle for Packed<SquareElem> {
-    #[typst_macros::time(name = "square", span = self.span())]
-    fn layout(
-        &self,
-        engine: &mut Engine,
-        styles: StyleChain,
-        regions: Regions,
-    ) -> SourceResult<Frame> {
-        layout(
-            engine,
-            styles,
-            regions,
-            ShapeKind::Square,
-            &self.body(styles),
-            Axes::new(self.width(styles), self.height(styles)),
-            self.fill(styles),
-            self.stroke(styles),
-            self.inset(styles),
-            self.outset(styles),
-            self.radius(styles),
-            self.span(),
+impl Show for Packed<SquareElem> {
+    fn show(&self, _: &mut Engine, styles: StyleChain) -> SourceResult<Content> {
+        Ok(BlockElem::single_layouter(
+            self.clone(),
+            |elem, engine, locator, styles, regions| {
+                layout_shape(
+                    engine,
+                    locator,
+                    styles,
+                    regions,
+                    ShapeKind::Square,
+                    elem.body(styles),
+                    elem.fill(styles),
+                    elem.stroke(styles),
+                    elem.inset(styles),
+                    elem.outset(styles),
+                    elem.radius(styles),
+                    elem.span(),
+                )
+            },
         )
+        .with_width(self.width(styles))
+        .with_height(self.height(styles))
+        .pack()
+        .spanned(self.span()))
     }
 }
 
@@ -276,7 +287,7 @@ impl LayoutSingle for Packed<SquareElem> {
 ///   to fit the content.
 /// ]
 /// ```
-#[elem(LayoutSingle)]
+#[elem(Show)]
 pub struct EllipseElem {
     /// The ellipse's width, relative to its parent container.
     pub width: Smart<Rel<Length>>,
@@ -312,31 +323,35 @@ pub struct EllipseElem {
     /// When this is omitted, the ellipse takes on a default size of at most
     /// `{45pt}` by `{30pt}`.
     #[positional]
+    #[borrowed]
     pub body: Option<Content>,
 }
 
-impl LayoutSingle for Packed<EllipseElem> {
-    #[typst_macros::time(name = "ellipse", span = self.span())]
-    fn layout(
-        &self,
-        engine: &mut Engine,
-        styles: StyleChain,
-        regions: Regions,
-    ) -> SourceResult<Frame> {
-        layout(
-            engine,
-            styles,
-            regions,
-            ShapeKind::Ellipse,
-            &self.body(styles),
-            Axes::new(self.width(styles), self.height(styles)),
-            self.fill(styles),
-            self.stroke(styles).map(|s| Sides::splat(Some(s))),
-            self.inset(styles),
-            self.outset(styles),
-            Corners::splat(None),
-            self.span(),
+impl Show for Packed<EllipseElem> {
+    fn show(&self, _: &mut Engine, styles: StyleChain) -> SourceResult<Content> {
+        Ok(BlockElem::single_layouter(
+            self.clone(),
+            |elem, engine, locator, styles, regions| {
+                layout_shape(
+                    engine,
+                    locator,
+                    styles,
+                    regions,
+                    ShapeKind::Ellipse,
+                    elem.body(styles),
+                    elem.fill(styles),
+                    elem.stroke(styles).map(|s| Sides::splat(Some(s))),
+                    elem.inset(styles),
+                    elem.outset(styles),
+                    Corners::splat(None),
+                    elem.span(),
+                )
+            },
         )
+        .with_width(self.width(styles))
+        .with_height(self.height(styles))
+        .pack()
+        .spanned(self.span()))
     }
 }
 
@@ -354,7 +369,7 @@ impl LayoutSingle for Packed<EllipseElem> {
 ///   sized to fit.
 /// ]
 /// ```
-#[elem(LayoutSingle)]
+#[elem(Show)]
 pub struct CircleElem {
     /// The circle's radius. This is mutually exclusive with `width` and
     /// `height`.
@@ -415,43 +430,48 @@ pub struct CircleElem {
     /// The content to place into the circle. The circle expands to fit this
     /// content, keeping the 1-1 aspect ratio.
     #[positional]
+    #[borrowed]
     pub body: Option<Content>,
 }
 
-impl LayoutSingle for Packed<CircleElem> {
-    #[typst_macros::time(name = "circle", span = self.span())]
-    fn layout(
-        &self,
-        engine: &mut Engine,
-        styles: StyleChain,
-        regions: Regions,
-    ) -> SourceResult<Frame> {
-        layout(
-            engine,
-            styles,
-            regions,
-            ShapeKind::Circle,
-            &self.body(styles),
-            Axes::new(self.width(styles), self.height(styles)),
-            self.fill(styles),
-            self.stroke(styles).map(|s| Sides::splat(Some(s))),
-            self.inset(styles),
-            self.outset(styles),
-            Corners::splat(None),
-            self.span(),
+impl Show for Packed<CircleElem> {
+    fn show(&self, _: &mut Engine, styles: StyleChain) -> SourceResult<Content> {
+        Ok(BlockElem::single_layouter(
+            self.clone(),
+            |elem, engine, locator, styles, regions| {
+                layout_shape(
+                    engine,
+                    locator,
+                    styles,
+                    regions,
+                    ShapeKind::Circle,
+                    elem.body(styles),
+                    elem.fill(styles),
+                    elem.stroke(styles).map(|s| Sides::splat(Some(s))),
+                    elem.inset(styles),
+                    elem.outset(styles),
+                    Corners::splat(None),
+                    elem.span(),
+                )
+            },
         )
+        .with_width(self.width(styles))
+        .with_height(self.height(styles))
+        .pack()
+        .spanned(self.span()))
     }
 }
 
 /// Layout a shape.
+#[typst_macros::time(span = span)]
 #[allow(clippy::too_many_arguments)]
-fn layout(
+fn layout_shape(
     engine: &mut Engine,
+    locator: Locator,
     styles: StyleChain,
-    regions: Regions,
+    region: Region,
     kind: ShapeKind,
     body: &Option<Content>,
-    sizing: Axes<Smart<Rel<Length>>>,
     fill: Option<Paint>,
     stroke: Smart<Sides<Option<Option<Stroke<Abs>>>>>,
     inset: Sides<Option<Rel<Abs>>>,
@@ -459,47 +479,43 @@ fn layout(
     radius: Corners<Option<Rel<Abs>>>,
     span: Span,
 ) -> SourceResult<Frame> {
-    let resolved = sizing
-        .zip_map(regions.base(), |s, r| s.map(|v| v.resolve(styles).relative_to(r)));
-
     let mut frame;
-    let mut inset = inset.unwrap_or_default();
-
     if let Some(child) = body {
-        let region = resolved.unwrap_or(regions.base());
-
+        let mut inset = inset.unwrap_or_default();
         if kind.is_round() {
-            inset = inset.map(|side| side + Ratio::new(0.5 - SQRT_2 / 4.0));
+            // Apply extra inset to round shapes.
+            inset = inset.map(|v| v + Ratio::new(0.5 - SQRT_2 / 4.0));
+        }
+        let has_inset = !inset.is_zero();
+
+        // Take the inset, if any, into account.
+        let mut pod = region;
+        if has_inset {
+            pod.size = crate::layout::shrink(region.size, &inset);
         }
 
-        // Pad the child.
-        let child = child.clone().padded(inset.map(|side| side.map(Length::from)));
-        let expand = sizing.as_ref().map(Smart::is_custom);
-        let pod = Regions::one(region, expand);
-        frame = child.layout(engine, styles, pod)?.into_frame();
+        // Layout the child.
+        frame = child
+            .layout(engine, locator.relayout(), styles, pod.into_regions())?
+            .into_frame();
 
-        // Enforce correct size.
-        *frame.size_mut() = expand.select(region, frame.size());
-
-        // Relayout with full expansion into square region to make sure
-        // the result is really a square or circle.
+        // If the child is a square or circle, relayout with full expansion into
+        // square region to make sure the result is really quadratic.
         if kind.is_quadratic() {
-            frame.set_size(Size::splat(frame.size().max_by_side()));
-            let length = frame.size().max_by_side().min(region.min_by_side());
-            let pod = Regions::one(Size::splat(length), Axes::splat(true));
-            frame = child.layout(engine, styles, pod)?.into_frame();
+            let length = frame.size().max_by_side().min(pod.size.min_by_side());
+            let quad_pod = Regions::one(Size::splat(length), Axes::splat(true));
+            frame = child.layout(engine, locator, styles, quad_pod)?.into_frame();
         }
 
-        // Enforce correct size again.
-        *frame.size_mut() = expand.select(region, frame.size());
-        if kind.is_quadratic() {
-            frame.set_size(Size::splat(frame.size().max_by_side()));
+        // Apply the inset.
+        if has_inset {
+            crate::layout::grow(&mut frame, &inset);
         }
     } else {
         // The default size that a shape takes on if it has no child and
         // enough space.
         let default = Size::new(Abs::pt(45.0), Abs::pt(30.0));
-        let mut size = resolved.unwrap_or(default.min(regions.base()));
+        let mut size = region.expand.select(region.size, default.min(region.size));
         if kind.is_quadratic() {
             size = Size::splat(size.min_by_side());
         }
@@ -526,9 +542,9 @@ fn layout(
         } else {
             frame.fill_and_stroke(
                 fill,
-                stroke,
-                outset.unwrap_or_default(),
-                radius.unwrap_or_default(),
+                &stroke,
+                &outset.unwrap_or_default(),
+                &radius.unwrap_or_default(),
                 span,
             );
         }
@@ -569,8 +585,20 @@ pub struct Shape {
     pub geometry: Geometry,
     /// The shape's background fill.
     pub fill: Option<Paint>,
+    /// The shape's fill rule.
+    pub fill_rule: FillRule,
     /// The shape's border stroke.
     pub stroke: Option<FixedStroke>,
+}
+
+/// A path filling rule.
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Hash, Cast)]
+pub enum FillRule {
+    /// Specifies that "inside" is computed by a non-zero sum of signed edge crossings.
+    #[default]
+    NonZero,
+    /// Specifies that "inside" is computed by an odd number of edge crossings.
+    EvenOdd,
 }
 
 /// A shape's geometry.
@@ -587,12 +615,22 @@ pub enum Geometry {
 impl Geometry {
     /// Fill the geometry without a stroke.
     pub fn filled(self, fill: Paint) -> Shape {
-        Shape { geometry: self, fill: Some(fill), stroke: None }
+        Shape {
+            geometry: self,
+            fill: Some(fill),
+            fill_rule: FillRule::default(),
+            stroke: None,
+        }
     }
 
     /// Stroke the geometry without a fill.
     pub fn stroked(self, stroke: FixedStroke) -> Shape {
-        Shape { geometry: self, fill: None, stroke: Some(stroke) }
+        Shape {
+            geometry: self,
+            fill: None,
+            fill_rule: FillRule::default(),
+            stroke: Some(stroke),
+        }
     }
 
     /// The bounding box of the geometry.
@@ -627,13 +665,18 @@ pub(crate) fn ellipse(
     path.cubic_to(point(rx, my), point(mx, ry), point(z, ry));
     path.cubic_to(point(-mx, ry), point(-rx, my), point(-rx, z));
 
-    Shape { geometry: Geometry::Path(path), stroke, fill }
+    Shape {
+        geometry: Geometry::Path(path),
+        stroke,
+        fill,
+        fill_rule: FillRule::default(),
+    }
 }
 
 /// Creates a new rectangle as a path.
 pub(crate) fn clip_rect(
     size: Size,
-    radius: Corners<Rel<Abs>>,
+    radius: &Corners<Rel<Abs>>,
     stroke: &Sides<Option<FixedStroke>>,
 ) -> Path {
     let stroke_widths = stroke
@@ -644,8 +687,7 @@ pub(crate) fn clip_rect(
         + stroke_widths.iter().cloned().min().unwrap_or(Abs::zero());
 
     let radius = radius.map(|side| side.relative_to(max_radius * 2.0).min(max_radius));
-
-    let corners = corners_control_points(size, radius, stroke, stroke_widths);
+    let corners = corners_control_points(size, &radius, stroke, &stroke_widths);
 
     let mut path = Path::new();
     if corners.top_left.arc_inner() {
@@ -674,12 +716,12 @@ pub(crate) fn clip_rect(
 /// - use fill for sides for best looks
 pub(crate) fn styled_rect(
     size: Size,
-    radius: Corners<Rel<Abs>>,
+    radius: &Corners<Rel<Abs>>,
     fill: Option<Paint>,
-    stroke: Sides<Option<FixedStroke>>,
+    stroke: &Sides<Option<FixedStroke>>,
 ) -> Vec<Shape> {
     if stroke.is_uniform() && radius.iter().cloned().all(Rel::is_zero) {
-        simple_rect(size, fill, stroke.top)
+        simple_rect(size, fill, stroke.top.clone())
     } else {
         segmented_rect(size, radius, fill, stroke)
     }
@@ -691,14 +733,19 @@ fn simple_rect(
     fill: Option<Paint>,
     stroke: Option<FixedStroke>,
 ) -> Vec<Shape> {
-    vec![Shape { geometry: Geometry::Rect(size), fill, stroke }]
+    vec![Shape {
+        geometry: Geometry::Rect(size),
+        fill,
+        stroke,
+        fill_rule: FillRule::default(),
+    }]
 }
 
 fn corners_control_points(
     size: Size,
-    radius: Corners<Abs>,
+    radius: &Corners<Abs>,
     strokes: &Sides<Option<FixedStroke>>,
-    stroke_widths: Sides<Abs>,
+    stroke_widths: &Sides<Abs>,
 ) -> Corners<ControlPoints> {
     Corners {
         top_left: Corner::TopLeft,
@@ -726,9 +773,9 @@ fn corners_control_points(
 /// Use stroke and fill for the rectangle
 fn segmented_rect(
     size: Size,
-    radius: Corners<Rel<Abs>>,
+    radius: &Corners<Rel<Abs>>,
     fill: Option<Paint>,
-    strokes: Sides<Option<FixedStroke>>,
+    strokes: &Sides<Option<FixedStroke>>,
 ) -> Vec<Shape> {
     let mut res = vec![];
     let stroke_widths = strokes
@@ -739,8 +786,7 @@ fn segmented_rect(
         + stroke_widths.iter().cloned().min().unwrap_or(Abs::zero());
 
     let radius = radius.map(|side| side.relative_to(max_radius * 2.0).min(max_radius));
-
-    let corners = corners_control_points(size, radius, &strokes, stroke_widths);
+    let corners = corners_control_points(size, &radius, strokes, &stroke_widths);
 
     // insert stroked sides below filled sides
     let mut stroke_insert = 0;
@@ -767,6 +813,7 @@ fn segmented_rect(
         res.push(Shape {
             geometry: Geometry::Path(path),
             fill: Some(fill),
+            fill_rule: FillRule::default(),
             stroke: None,
         });
         stroke_insert += 1;
@@ -786,10 +833,7 @@ fn segmented_rect(
             let start = last;
             let end = current;
             last = current;
-            let stroke = match strokes.get_ref(start.side_cw()) {
-                None => continue,
-                Some(stroke) => stroke.clone(),
-            };
+            let Some(stroke) = strokes.get_ref(start.side_cw()) else { continue };
             let (shape, ontop) = segment(start, end, &corners, stroke);
             if ontop {
                 res.push(shape);
@@ -798,7 +842,7 @@ fn segmented_rect(
                 stroke_insert += 1;
             }
         }
-    } else if let Some(stroke) = strokes.top {
+    } else if let Some(stroke) = &strokes.top {
         // single segment
         let (shape, _) = segment(Corner::TopLeft, Corner::TopLeft, &corners, stroke);
         res.push(shape);
@@ -848,7 +892,7 @@ fn segment(
     start: Corner,
     end: Corner,
     corners: &Corners<ControlPoints>,
-    stroke: FixedStroke,
+    stroke: &FixedStroke,
 ) -> (Shape, bool) {
     fn fill_corner(corner: &ControlPoints) -> bool {
         corner.stroke_before != corner.stroke_after
@@ -883,12 +927,12 @@ fn segment(
         .unwrap_or(true);
 
     let use_fill = solid && fill_corners(start, end, corners);
-
     let shape = if use_fill {
         fill_segment(start, end, corners, stroke)
     } else {
-        stroke_segment(start, end, corners, stroke)
+        stroke_segment(start, end, corners, stroke.clone())
     };
+
     (shape, use_fill)
 }
 
@@ -899,7 +943,7 @@ fn stroke_segment(
     corners: &Corners<ControlPoints>,
     stroke: FixedStroke,
 ) -> Shape {
-    // create start corner
+    // Create start corner.
     let mut path = Path::new();
     path_segment(start, end, corners, &mut path);
 
@@ -907,6 +951,7 @@ fn stroke_segment(
         geometry: Geometry::Path(path),
         stroke: Some(stroke),
         fill: None,
+        fill_rule: FillRule::default(),
     }
 }
 
@@ -915,7 +960,7 @@ fn fill_segment(
     start: Corner,
     end: Corner,
     corners: &Corners<ControlPoints>,
-    stroke: FixedStroke,
+    stroke: &FixedStroke,
 ) -> Shape {
     let mut path = Path::new();
 
@@ -1004,7 +1049,8 @@ fn fill_segment(
     Shape {
         geometry: Geometry::Path(path),
         stroke: None,
-        fill: Some(stroke.paint),
+        fill: Some(stroke.paint.clone()),
+        fill_rule: FillRule::default(),
     }
 }
 
@@ -1108,7 +1154,7 @@ impl ControlPoints {
             + 2.0 * (o.y - c_i.y).to_raw() * (c_i.y - c_o.y).to_raw();
         let c = (c_i.x - c_o.x).to_raw().powi(2) + (c_i.y - c_o.y).to_raw().powi(2)
             - r.to_raw().powi(2);
-        let t = (-b + (b * b - 4.0 * a * c).sqrt()) / (2.0 * a);
+        let t = (-b + (b * b - 4.0 * a * c).max(0.0).sqrt()) / (2.0 * a);
         c_i + t * (o - c_i)
     }
 

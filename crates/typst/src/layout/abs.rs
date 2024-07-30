@@ -5,7 +5,10 @@ use std::ops::{Add, Div, Mul, Neg, Rem};
 use ecow::EcoString;
 
 use crate::foundations::{cast, repr, Fold, Repr, Value};
-use crate::util::{Numeric, Scalar};
+use crate::utils::{Numeric, Scalar};
+
+/// The epsilon for approximate comparisons.
+const EPS: f64 = 1e-6;
 
 /// An absolute length.
 #[derive(Default, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -54,7 +57,7 @@ impl Abs {
 
     /// Get the value of this absolute length in raw units.
     pub const fn to_raw(self) -> f64 {
-        (self.0).get()
+        self.0.get()
     }
 
     /// Get the value of this absolute length in a unit.
@@ -110,23 +113,22 @@ impl Abs {
     /// Whether the other absolute length fits into this one (i.e. is smaller).
     /// Allows for a bit of slack.
     pub fn fits(self, other: Self) -> bool {
-        self.0 + 1e-6 >= other.0
+        self.0 + EPS >= other.0
     }
 
     /// Compares two absolute lengths for whether they are approximately equal.
     pub fn approx_eq(self, other: Self) -> bool {
-        self == other || (self - other).to_raw().abs() < 1e-6
+        self == other || (self - other).to_raw().abs() < EPS
     }
 
-    /// Perform a checked division by a number, returning zero if the result
-    /// is not finite.
-    pub fn safe_div(self, number: f64) -> Self {
-        let result = self.to_raw() / number;
-        if result.is_finite() {
-            Self::raw(result)
-        } else {
-            Self::zero()
-        }
+    /// Whether the size is close to zero or negative.
+    pub fn approx_empty(self) -> bool {
+        self.to_raw() <= EPS
+    }
+
+    /// Returns a number that represent the sign of this length
+    pub fn signum(self) -> f64 {
+        self.0.get().signum()
     }
 }
 
@@ -168,7 +170,7 @@ impl Add for Abs {
     }
 }
 
-sub_impl!(Abs - Abs -> Abs);
+typst_utils::sub_impl!(Abs - Abs -> Abs);
 
 impl Mul<f64> for Abs {
     type Output = Self;
@@ -202,10 +204,10 @@ impl Div for Abs {
     }
 }
 
-assign_impl!(Abs += Abs);
-assign_impl!(Abs -= Abs);
-assign_impl!(Abs *= f64);
-assign_impl!(Abs /= f64);
+typst_utils::assign_impl!(Abs += Abs);
+typst_utils::assign_impl!(Abs -= Abs);
+typst_utils::assign_impl!(Abs *= f64);
+typst_utils::assign_impl!(Abs /= f64);
 
 impl Rem for Abs {
     type Output = Self;

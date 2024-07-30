@@ -2,7 +2,35 @@ use std::fmt::{self, Debug, Formatter};
 
 use crate::layout::{Abs, Axes, Size};
 
+/// A single region to layout into.
+#[derive(Debug, Copy, Clone, Hash)]
+pub struct Region {
+    /// The size of the region.
+    pub size: Size,
+    /// Whether elements should expand to fill the regions instead of shrinking
+    /// to fit the content.
+    pub expand: Axes<bool>,
+}
+
+impl Region {
+    /// Create a new region.
+    pub fn new(size: Size, expand: Axes<bool>) -> Self {
+        Self { size, expand }
+    }
+
+    /// Turns this into a region sequence.
+    pub fn into_regions(self) -> Regions<'static> {
+        Regions::one(self.size, self.expand)
+    }
+}
+
 /// A sequence of regions to layout into.
+///
+/// A *region* is a contiguous rectangular space in which elements
+/// can be laid out. All regions within a `Regions` object have the
+/// same width, namely `self.size.x`. This means that it is not
+/// currently possible to, for instance, have content wrap to the
+/// side of a floating element.
 #[derive(Copy, Clone, Hash)]
 pub struct Regions<'a> {
     /// The remaining size of the first region.
@@ -74,7 +102,7 @@ impl Regions<'_> {
             backlog,
             last: self.last.map(|y| f(Size::new(x, y)).y),
             expand: self.expand,
-            root: false,
+            root: self.root,
         }
     }
 

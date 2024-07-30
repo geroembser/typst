@@ -6,7 +6,9 @@ use ecow::{eco_format, EcoString};
 use unicode_math_class::MathClass;
 
 use crate::set::SyntaxSet;
-use crate::{ast, is_ident, is_newline, set, LexMode, Lexer, SyntaxKind, SyntaxNode};
+use crate::{
+    ast, is_ident, is_newline, set, LexMode, Lexer, SyntaxError, SyntaxKind, SyntaxNode,
+};
 
 /// Parses a source file.
 pub fn parse(text: &str) -> SyntaxNode {
@@ -41,7 +43,7 @@ fn markup(
 ) {
     let m = p.marker();
     let mut nesting: usize = 0;
-    while !p.eof() {
+    while !p.end() {
         match p.current() {
             SyntaxKind::LeftBracket => nesting += 1,
             SyntaxKind::RightBracket if nesting > 0 => nesting -= 1,
@@ -76,7 +78,7 @@ pub(super) fn reparse_markup(
     mut stop: impl FnMut(SyntaxKind) -> bool,
 ) -> Option<Vec<SyntaxNode>> {
     let mut p = Parser::new(text, range.start, LexMode::Markup);
-    while !p.eof() && p.current_start() < range.end {
+    while !p.end() && p.current_start() < range.end {
         match p.current() {
             SyntaxKind::LeftBracket => *nesting += 1,
             SyntaxKind::RightBracket if *nesting > 0 => *nesting -= 1,
@@ -116,13 +118,13 @@ fn markup_expr(p: &mut Parser, at_start: &mut bool) {
         | SyntaxKind::Escape
         | SyntaxKind::Shorthand
         | SyntaxKind::SmartQuote
-        | SyntaxKind::Raw
         | SyntaxKind::Link
         | SyntaxKind::Label => p.eat(),
 
         SyntaxKind::Hash => embedded_code_expr(p),
         SyntaxKind::Star => strong(p),
         SyntaxKind::Underscore => emph(p),
+        SyntaxKind::RawDelim => raw(p),
         SyntaxKind::HeadingMarker if *at_start => heading(p),
         SyntaxKind::ListMarker if *at_start => list_item(p),
         SyntaxKind::EnumMarker if *at_start => enum_item(p),
@@ -172,6 +174,22 @@ fn emph(p: &mut Parser) {
     p.wrap(m, SyntaxKind::Emph);
 }
 
+/// Parses raw text with optional syntax highlighting: `` `...` ``.
+fn raw(p: &mut Parser) {
+    let m = p.marker();
+    p.enter(LexMode::Raw);
+    p.assert(SyntaxKind::RawDelim);
+
+    // Eats until the closing delimiter.
+    while !p.end() && !p.at(SyntaxKind::RawDelim) {
+        p.eat();
+    }
+
+    p.expect(SyntaxKind::RawDelim);
+    p.exit();
+    p.wrap(m, SyntaxKind::Raw);
+}
+
 /// Parses a section heading: `= Introduction`.
 fn heading(p: &mut Parser) {
     const END: SyntaxSet = SyntaxSet::new()
@@ -183,7 +201,8 @@ fn heading(p: &mut Parser) {
     p.assert(SyntaxKind::HeadingMarker);
     whitespace_line(p);
     markup(p, false, usize::MAX, |p| {
-        p.at_set(END) && (!p.at(SyntaxKind::Space) || p.peek() == SyntaxKind::Label)
+        p.at_set(END)
+            && (!p.at(SyntaxKind::Space) || p.lexer.clone().next() == SyntaxKind::Label)
     });
     p.wrap(m, SyntaxKind::Heading);
 }
@@ -255,7 +274,7 @@ fn equation(p: &mut Parser) {
 /// Parses the contents of a mathematical equation: `x^2 + 1`.
 fn math(p: &mut Parser, mut stop: impl FnMut(&Parser) -> bool) {
     let m = p.marker();
-    while !p.eof() && !stop(p) {
+    while !p.end() && !stop(p) {
         if p.at_set(set::MATH_EXPR) {
             math_expr(p);
         } else {
@@ -268,7 +287,7 @@ fn math(p: &mut Parser, mut stop: impl FnMut(&Parser) -> bool) {
 /// Parses a single math expression: This includes math elements like
 /// attachment, fractions, and roots, and embedded code expressions.
 fn math_expr(p: &mut Parser) {
-    math_expr_prec(p, 0, SyntaxKind::Eof)
+    math_expr_prec(p, 0, SyntaxKind::End)
 }
 
 /// Parses a math expression with at least the given precedence.
@@ -352,7 +371,7 @@ fn math_expr_prec(p: &mut Parser, min_prec: usize, stop: SyntaxKind) {
     // Whether there were _any_ primes in the loop.
     let mut primed = false;
 
-    while !p.eof() && !p.at(stop) {
+    while !p.end() && !p.at(stop) {
         if p.directly_at(SyntaxKind::Text) && p.current_text() == "!" {
             p.eat();
             p.wrap(m, SyntaxKind::Math);
@@ -372,11 +391,6 @@ fn math_expr_prec(p: &mut Parser, min_prec: usize, stop: SyntaxKind) {
 
             primed = true;
             continue;
-        }
-
-        // Separate primes and superscripts to different attachments.
-        if primed && p.current() == SyntaxKind::Hat {
-            p.wrap(m, SyntaxKind::MathAttach);
         }
 
         let Some((kind, stop, assoc, mut prec)) = math_op(p.current()) else {
@@ -410,9 +424,9 @@ fn math_expr_prec(p: &mut Parser, min_prec: usize, stop: SyntaxKind) {
         math_expr_prec(p, prec, stop);
         math_unparen(p, m2);
 
-        if p.eat_if(SyntaxKind::Underscore) || (!primed && p.eat_if(SyntaxKind::Hat)) {
+        if p.eat_if(SyntaxKind::Underscore) || p.eat_if(SyntaxKind::Hat) {
             let m3 = p.marker();
-            math_expr_prec(p, prec, SyntaxKind::Eof);
+            math_expr_prec(p, prec, SyntaxKind::End);
             math_unparen(p, m3);
         }
 
@@ -432,7 +446,7 @@ fn math_delimited(p: &mut Parser) {
     let m = p.marker();
     p.eat();
     let m2 = p.marker();
-    while !p.eof() && !p.at(SyntaxKind::Dollar) {
+    while !p.end() && !p.at(SyntaxKind::Dollar) {
         if math_class(p.current_text()) == Some(MathClass::Closing) {
             p.wrap(m2, SyntaxKind::Math);
             p.eat();
@@ -490,7 +504,7 @@ fn math_op(kind: SyntaxKind) -> Option<(SyntaxKind, SyntaxKind, ast::Assoc, usiz
             Some((SyntaxKind::MathAttach, SyntaxKind::Underscore, ast::Assoc::Right, 2))
         }
         SyntaxKind::Slash => {
-            Some((SyntaxKind::MathFrac, SyntaxKind::Eof, ast::Assoc::Left, 1))
+            Some((SyntaxKind::MathFrac, SyntaxKind::End, ast::Assoc::Left, 1))
         }
         _ => None,
     }
@@ -506,7 +520,7 @@ fn math_args(p: &mut Parser) {
     let mut array = p.marker();
     let mut arg = p.marker();
 
-    while !p.eof() && !p.at(SyntaxKind::Dollar) {
+    while !p.end() && !p.at(SyntaxKind::Dollar) {
         if namable
             && (p.at(SyntaxKind::MathIdent) || p.at(SyntaxKind::Text))
             && p.text[p.current_end()..].starts_with(':')
@@ -575,10 +589,23 @@ fn math_args(p: &mut Parser) {
     p.wrap(m, SyntaxKind::Args);
 }
 
+/// Wrap math function arguments in a "Math" SyntaxKind to combine adjacent expressions
+/// or create blank content.
+///
+/// We don't wrap when `exprs == 1`, as there is only one expression, so the grouping
+/// isn't needed, and this would change the type of the expression from potentially
+/// non-content to content.
+///
+/// Note that `exprs` might be 0 if we have whitespace or trivia before a comma i.e.
+/// `mat(; ,)` or `sin(x, , , ,)`. This would create an empty Math element before that
+/// trivia if we called `p.wrap()` -- breaking the expected AST for 2-d arguments -- so
+/// we instead manually wrap to our current marker using `p.wrap_within()`.
 fn maybe_wrap_in_math(p: &mut Parser, arg: Marker, named: Option<Marker>) {
     let exprs = p.post_process(arg).filter(|node| node.is::<ast::Expr>()).count();
     if exprs != 1 {
-        p.wrap(arg, SyntaxKind::Math);
+        // Convert 0 exprs into a blank math element (so empty arguments are allowed).
+        // Convert 2+ exprs into a math element (so they become a joined sequence).
+        p.wrap_within(arg, p.marker(), SyntaxKind::Math);
     }
 
     if let Some(m) = named {
@@ -595,19 +622,23 @@ fn code(p: &mut Parser, stop: impl FnMut(&Parser) -> bool) {
 
 /// Parses a sequence of code expressions.
 fn code_exprs(p: &mut Parser, mut stop: impl FnMut(&Parser) -> bool) {
-    while !p.eof() && !stop(p) {
+    while !p.end() && !stop(p) {
         p.enter_newline_mode(NewlineMode::Contextual);
 
         let at_expr = p.at_set(set::CODE_EXPR);
         if at_expr {
             code_expr(p);
-            if !p.eof() && !stop(p) && !p.eat_if(SyntaxKind::Semicolon) {
+            if !p.end() && !stop(p) && !p.eat_if(SyntaxKind::Semicolon) {
                 p.expected("semicolon or line break");
+                if p.at(SyntaxKind::Label) {
+                    p.hint("labels can only be applied in markup mode");
+                    p.hint("try wrapping your code in a markup block (`[ ]`)");
+                }
             }
         }
 
         p.exit_newline_mode();
-        if !at_expr && !p.eof() {
+        if !at_expr && !p.end() {
             p.unexpected();
         }
     }
@@ -630,14 +661,14 @@ fn embedded_code_expr(p: &mut Parser) {
     code_expr_prec(p, true, 0);
 
     // Consume error for things like `#12p` or `#"abc\"`.#
-    if !at && !p.current().is_trivia() && !p.eof() {
+    if !at && !p.current().is_trivia() && !p.end() {
         p.unexpected();
     }
 
     let semi =
         (stmt || p.directly_at(SyntaxKind::Semicolon)) && p.eat_if(SyntaxKind::Semicolon);
 
-    if stmt && !semi && !p.eof() && !p.at(SyntaxKind::RightBracket) {
+    if stmt && !semi && !p.end() && !p.at(SyntaxKind::RightBracket) {
         p.expected("semicolon or line break");
     }
 
@@ -666,7 +697,7 @@ fn code_expr_prec(p: &mut Parser, atomic: bool, min_prec: usize) {
         }
 
         let at_field_or_method =
-            p.directly_at(SyntaxKind::Dot) && p.peek() == SyntaxKind::Ident;
+            p.directly_at(SyntaxKind::Dot) && p.lexer.clone().next() == SyntaxKind::Ident;
 
         if atomic && !at_field_or_method {
             break;
@@ -745,11 +776,13 @@ fn code_primary(p: &mut Parser, atomic: bool) {
 
         SyntaxKind::LeftBrace => code_block(p),
         SyntaxKind::LeftBracket => content_block(p),
-        SyntaxKind::LeftParen => expr_with_paren(p),
+        SyntaxKind::LeftParen => expr_with_paren(p, atomic),
+        SyntaxKind::RawDelim => raw(p),
         SyntaxKind::Dollar => equation(p),
         SyntaxKind::Let => let_binding(p),
         SyntaxKind::Set => set_rule(p),
         SyntaxKind::Show => show_rule(p),
+        SyntaxKind::Context => contextual(p, atomic),
         SyntaxKind::If => conditional(p),
         SyntaxKind::While => while_loop(p),
         SyntaxKind::For => for_loop(p),
@@ -766,8 +799,7 @@ fn code_primary(p: &mut Parser, atomic: bool) {
         | SyntaxKind::Bool
         | SyntaxKind::Numeric
         | SyntaxKind::Str
-        | SyntaxKind::Label
-        | SyntaxKind::Raw => p.eat(),
+        | SyntaxKind::Label => p.eat(),
 
         _ => p.expected("expression"),
     }
@@ -889,6 +921,14 @@ fn show_rule(p: &mut Parser) {
     p.wrap(m, SyntaxKind::ShowRule);
 }
 
+/// Parses a contextual expression: `context text.lang`.
+fn contextual(p: &mut Parser, atomic: bool) {
+    let m = p.marker();
+    p.assert(SyntaxKind::Context);
+    code_expr_prec(p, atomic, 0);
+    p.wrap(m, SyntaxKind::Contextual);
+}
+
 /// Parses an if-else conditional: `if x { y } else { z }`.
 fn conditional(p: &mut Parser) {
     let m = p.marker();
@@ -958,11 +998,18 @@ fn module_import(p: &mut Parser) {
 /// Parses items to import from a module: `a, b, c`.
 fn import_items(p: &mut Parser) {
     let m = p.marker();
-    while !p.eof() && !p.at(SyntaxKind::Semicolon) {
+    while !p.current().is_terminator() {
         let item_marker = p.marker();
         if !p.eat_if(SyntaxKind::Ident) {
             p.unexpected();
         }
+
+        // Nested import path: `a.b.c`
+        while p.eat_if(SyntaxKind::Dot) {
+            p.expect(SyntaxKind::Ident);
+        }
+
+        p.wrap(item_marker, SyntaxKind::ImportItemPath);
 
         // Rename imported item.
         if p.eat_if(SyntaxKind::As) {
@@ -1010,13 +1057,16 @@ fn return_stmt(p: &mut Parser) {
 }
 
 /// An expression that starts with a parenthesis.
-fn expr_with_paren(p: &mut Parser) {
+fn expr_with_paren(p: &mut Parser, atomic: bool) {
     // If we've seen this position before and have a memoized result, just use
     // it. See below for more explanation about this memoization.
     let start = p.current_start();
-    if let Some((range, end_point)) = p.memo.get(&start) {
-        p.nodes.extend(p.memo_arena[range.clone()].iter().cloned());
-        p.restore(end_point.clone());
+    if let Some((range, end_point)) = p.memo.get(&start).cloned() {
+        // Restore the end point first, so that it doesn't truncate our freshly
+        // pushed nodes. If the current length of `p.nodes` doesn't match what
+        // we had in the memoized run, this might otherwise happen.
+        p.restore(end_point);
+        p.nodes.extend(p.memo_arena[range].iter().cloned());
         return;
     }
 
@@ -1028,6 +1078,9 @@ fn expr_with_paren(p: &mut Parser) {
     // these are the most likely things. We can handle all of those in a single
     // pass.
     let kind = parenthesized_or_array_or_dict(p);
+    if atomic {
+        return;
+    }
 
     // If, however, '=>' or '=' follows, we must backtrack and reparse as either
     // a parameter list or a destructuring. To be able to do that, we created a
@@ -1129,7 +1182,7 @@ fn array_or_dict_item(p: &mut Parser, state: &mut GroupState) {
     let m = p.marker();
 
     if p.eat_if(SyntaxKind::Dots) {
-        // Parses a spreaded item: `..item`.
+        // Parses a spread item: `..item`.
         code_expr(p);
         p.wrap(m, SyntaxKind::Spread);
         state.maybe_just_parens = false;
@@ -1216,30 +1269,32 @@ fn args(p: &mut Parser) {
 /// Parses a single argument in an argument list.
 fn arg<'s>(p: &mut Parser<'s>, seen: &mut HashSet<&'s str>) {
     let m = p.marker();
+
+    // Parses a spread argument: `..args`.
     if p.eat_if(SyntaxKind::Dots) {
-        // Parses a spreaded argument: `..args`.
         code_expr(p);
         p.wrap(m, SyntaxKind::Spread);
-    } else if p.at(SyntaxKind::Ident) && p.peek() == SyntaxKind::Colon {
-        // Parses a named argument: `thickness: 12pt`.
-        let text = p.current_text();
-        p.assert(SyntaxKind::Ident);
-        if !seen.insert(text) {
-            p[m].convert_to_error(eco_format!("duplicate argument: {text}"));
+        return;
+    }
+
+    // Parses a normal positional argument or an argument name.
+    let was_at_expr = p.at_set(set::CODE_EXPR);
+    let text = p.current_text();
+    code_expr(p);
+
+    // Parses a named argument: `thickness: 12pt`.
+    if p.eat_if(SyntaxKind::Colon) {
+        // Recover from bad argument name.
+        if was_at_expr {
+            if p[m].kind() != SyntaxKind::Ident {
+                p[m].expected("identifier");
+            } else if !seen.insert(text) {
+                p[m].convert_to_error(eco_format!("duplicate argument: {text}"));
+            }
         }
-        p.assert(SyntaxKind::Colon);
+
         code_expr(p);
         p.wrap(m, SyntaxKind::Named);
-    } else {
-        // Parses a normal positional argument.
-        let at_expr = p.at_set(set::CODE_EXPR);
-        code_expr(p);
-
-        // Recover from bad named pair.
-        if at_expr && p.eat_if(SyntaxKind::Colon) {
-            p[m].expected("identifier");
-            code_expr(p);
-        }
     }
 }
 
@@ -1273,8 +1328,9 @@ fn params(p: &mut Parser) {
 /// Parses a single parameter in a parameter list.
 fn param<'s>(p: &mut Parser<'s>, seen: &mut HashSet<&'s str>, sink: &mut bool) {
     let m = p.marker();
+
+    // Parses argument sink: `..sink`.
     if p.eat_if(SyntaxKind::Dots) {
-        // Parses argument sink: `..sink`.
         if p.at_set(set::PATTERN_LEAF) {
             pattern_leaf(p, false, seen, Some("parameter"));
         }
@@ -1282,24 +1338,22 @@ fn param<'s>(p: &mut Parser<'s>, seen: &mut HashSet<&'s str>, sink: &mut bool) {
         if mem::replace(sink, true) {
             p[m].convert_to_error("only one argument sink is allowed");
         }
-    } else if p.at(SyntaxKind::Ident) && p.peek() == SyntaxKind::Colon {
-        // Parses named parameter: `thickness: 3pt`.
-        // We still use `pattern` even though we know it's just an identifier
-        // because it gives us duplicate parameter detection for free.
-        pattern(p, false, seen, Some("parameter"));
-        p.assert(SyntaxKind::Colon);
+        return;
+    }
+
+    // Parses a normal positional parameter or a parameter name.
+    let was_at_pat = p.at_set(set::PATTERN);
+    pattern(p, false, seen, Some("parameter"));
+
+    // Parses a named parameter: `thickness: 12pt`.
+    if p.eat_if(SyntaxKind::Colon) {
+        // Recover from bad parameter name.
+        if was_at_pat && p[m].kind() != SyntaxKind::Ident {
+            p[m].expected("identifier");
+        }
+
         code_expr(p);
         p.wrap(m, SyntaxKind::Named);
-    } else {
-        // Parses a normal position parameter.
-        let at_pat = p.at_set(set::PATTERN);
-        pattern(p, false, seen, Some("parameter"));
-
-        // Recover from bad named pair.
-        if at_pat && p.eat_if(SyntaxKind::Colon) {
-            p[m].expected("identifier");
-            code_expr(p);
-        }
     }
 }
 
@@ -1364,8 +1418,9 @@ fn destructuring_item<'s>(
     sink: &mut bool,
 ) {
     let m = p.marker();
+
+    // Parse destructuring sink: `..rest`.
     if p.eat_if(SyntaxKind::Dots) {
-        // Parse destructuring sink: `..rest`.
         if p.at_set(set::PATTERN_LEAF) {
             pattern_leaf(p, reassignment, seen, None);
         }
@@ -1373,23 +1428,27 @@ fn destructuring_item<'s>(
         if mem::replace(sink, true) {
             p[m].convert_to_error("only one destructuring sink is allowed");
         }
-    } else if p.at(SyntaxKind::Ident) && p.peek() == SyntaxKind::Colon {
-        // Parse named destructuring item.
-        p.assert(SyntaxKind::Ident);
-        p.assert(SyntaxKind::Colon);
+        return;
+    }
+
+    // Parse a normal positional pattern or a destructuring key.
+    let was_at_pat = p.at_set(set::PATTERN);
+    let checkpoint = p.checkpoint();
+    if !(p.eat_if(SyntaxKind::Ident) && p.at(SyntaxKind::Colon)) {
+        p.restore(checkpoint);
+        pattern(p, reassignment, seen, None);
+    }
+
+    // Parse named destructuring item.
+    if p.eat_if(SyntaxKind::Colon) {
+        // Recover from bad named destructuring.
+        if was_at_pat && p[m].kind() != SyntaxKind::Ident {
+            p[m].expected("identifier");
+        }
+
         pattern(p, reassignment, seen, None);
         p.wrap(m, SyntaxKind::Named);
         *maybe_just_parens = false;
-    } else {
-        // Parse positional destructuring item.
-        let at_pat = p.at_set(set::PATTERN);
-        pattern(p, reassignment, seen, None);
-
-        // Recover from bad named destructuring.
-        if at_pat && p.eat_if(SyntaxKind::Colon) {
-            p[m].expected("identifier");
-            pattern(p, reassignment, seen, None);
-        }
     }
 }
 
@@ -1401,12 +1460,11 @@ fn pattern_leaf<'s>(
     seen: &mut HashSet<&'s str>,
     dupe: Option<&'s str>,
 ) {
-    if !p.at_set(set::PATTERN_LEAF) {
-        if p.current().is_keyword() {
-            p.eat_and_get().expected("pattern");
-        } else {
-            p.expected("pattern");
-        }
+    if p.current().is_keyword() {
+        p.eat_and_get().expected("pattern");
+        return;
+    } else if !p.at_set(set::PATTERN_LEAF) {
+        p.expected("pattern");
         return;
     }
 
@@ -1523,12 +1581,8 @@ impl<'s> Parser<'s> {
         set.contains(self.current)
     }
 
-    fn peek(&self) -> SyntaxKind {
-        self.lexer.clone().next()
-    }
-
-    fn eof(&self) -> bool {
-        self.at(SyntaxKind::Eof)
+    fn end(&self) -> bool {
+        self.at(SyntaxKind::End)
     }
 
     fn directly_at(&self, kind: SyntaxKind) -> bool {
@@ -1541,6 +1595,7 @@ impl<'s> Parser<'s> {
         self.skip();
     }
 
+    #[track_caller]
     fn eat_and_get(&mut self) -> &mut SyntaxNode {
         let offset = self.nodes.len();
         self.save();
@@ -1610,6 +1665,7 @@ impl<'s> Parser<'s> {
         m.0 > 0 && self.nodes[m.0 - 1].kind().is_error()
     }
 
+    #[track_caller]
     fn post_process(&mut self, m: Marker) -> impl Iterator<Item = &mut SyntaxNode> {
         self.nodes[m.0..]
             .iter_mut()
@@ -1689,7 +1745,7 @@ impl<'s> Parser<'s> {
 
     fn unskip(&mut self) {
         if self.lexer.mode() != LexMode::Markup && self.prev_end != self.current_start {
-            while self.nodes.last().map_or(false, |last| last.kind().is_trivia()) {
+            while self.nodes.last().is_some_and(|last| last.kind().is_trivia()) {
                 self.nodes.pop();
             }
 
@@ -1701,8 +1757,8 @@ impl<'s> Parser<'s> {
     fn save(&mut self) {
         let text = self.current_text();
         if self.at(SyntaxKind::Error) {
-            let message = self.lexer.take_error().unwrap();
-            self.nodes.push(SyntaxNode::error(message, text));
+            let error = self.lexer.take_error().unwrap();
+            self.nodes.push(SyntaxNode::error(error, text));
         } else {
             self.nodes.push(SyntaxNode::leaf(self.current, text));
         }
@@ -1712,22 +1768,34 @@ impl<'s> Parser<'s> {
         }
     }
 
+    fn next_non_trivia(lexer: &mut Lexer<'s>) -> SyntaxKind {
+        loop {
+            let next = lexer.next();
+            // Loop is terminatable, because SyntaxKind::End is not a trivia.
+            if !next.is_trivia() {
+                break next;
+            }
+        }
+    }
+
     fn lex(&mut self) {
         self.current_start = self.lexer.cursor();
         self.current = self.lexer.next();
+
+        // Special cases to handle newlines in code mode.
         if self.lexer.mode() == LexMode::Code
             && self.lexer.newline()
             && match self.newline_modes.last() {
                 Some(NewlineMode::Continue) => false,
                 Some(NewlineMode::Contextual) => !matches!(
-                    self.lexer.clone().next(),
+                    Self::next_non_trivia(&mut self.lexer.clone()),
                     SyntaxKind::Else | SyntaxKind::Dot
                 ),
                 Some(NewlineMode::Stop) => true,
                 None => false,
             }
         {
-            self.current = SyntaxKind::Eof;
+            self.current = SyntaxKind::End;
         }
     }
 }
@@ -1750,6 +1818,7 @@ impl<'s> Parser<'s> {
 
     /// Consume the given closing delimiter or produce an error for the matching
     /// opening delimiter at `open`.
+    #[track_caller]
     fn expect_closing_delimiter(&mut self, open: Marker, kind: SyntaxKind) {
         if !self.eat_if(kind) {
             self.nodes[open.0].convert_to_error("unclosed delimiter");
@@ -1766,8 +1835,17 @@ impl<'s> Parser<'s> {
     /// Produce an error that the given `thing` was expected at the position
     /// of the marker `m`.
     fn expected_at(&mut self, m: Marker, thing: &str) {
-        let error = SyntaxNode::error(eco_format!("expected {thing}"), "");
+        let error =
+            SyntaxNode::error(SyntaxError::new(eco_format!("expected {thing}")), "");
         self.nodes.insert(m.0, error);
+    }
+
+    /// Produce a hint.
+    fn hint(&mut self, hint: &str) {
+        let m = self.before_trivia();
+        if let Some(error) = self.nodes.get_mut(m.0 - 1) {
+            error.hint(hint);
+        }
     }
 
     /// Consume the next token (if any) and produce an error stating that it was

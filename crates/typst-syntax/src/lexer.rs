@@ -4,7 +4,7 @@ use unicode_script::{Script, UnicodeScript};
 use unicode_segmentation::UnicodeSegmentation;
 use unscanny::Scanner;
 
-use crate::SyntaxKind;
+use crate::{SyntaxError, SyntaxKind};
 
 /// Splits up a string of source code into tokens.
 #[derive(Clone)]
@@ -16,8 +16,10 @@ pub(super) struct Lexer<'s> {
     mode: LexMode,
     /// Whether the last token contained a newline.
     newline: bool,
+    /// The state held by raw line lexing.
+    raw: Vec<(SyntaxKind, usize)>,
     /// An error for the last token.
-    error: Option<EcoString>,
+    error: Option<SyntaxError>,
 }
 
 /// What kind of tokens to emit.
@@ -29,6 +31,8 @@ pub(super) enum LexMode {
     Math,
     /// Keywords, literals and operators.
     Code,
+    /// The contents of a raw block.
+    Raw,
 }
 
 impl<'s> Lexer<'s> {
@@ -40,6 +44,7 @@ impl<'s> Lexer<'s> {
             mode,
             newline: false,
             error: None,
+            raw: Vec::new(),
         }
     }
 
@@ -70,7 +75,7 @@ impl<'s> Lexer<'s> {
     }
 
     /// Take out the last error, if any.
-    pub fn take_error(&mut self) -> Option<EcoString> {
+    pub fn take_error(&mut self) -> Option<SyntaxError> {
         self.error.take()
     }
 }
@@ -78,14 +83,31 @@ impl<'s> Lexer<'s> {
 impl Lexer<'_> {
     /// Construct a full-positioned syntax error.
     fn error(&mut self, message: impl Into<EcoString>) -> SyntaxKind {
-        self.error = Some(message.into());
+        self.error = Some(SyntaxError::new(message));
         SyntaxKind::Error
+    }
+
+    /// If the current node is an error, adds a hint.
+    fn hint(&mut self, message: impl Into<EcoString>) {
+        if let Some(error) = &mut self.error {
+            error.hints.push(message.into());
+        }
     }
 }
 
-/// Shared.
+/// Shared methods with all [`LexMode`].
 impl Lexer<'_> {
+    /// Proceed to the next token and return its [`SyntaxKind`]. Note the
+    /// token could be a [trivia](SyntaxKind::is_trivia).
     pub fn next(&mut self) -> SyntaxKind {
+        if self.mode == LexMode::Raw {
+            let Some((kind, end)) = self.raw.pop() else {
+                return SyntaxKind::End;
+            };
+            self.s.jump(end);
+            return kind;
+        }
+
         self.newline = false;
         self.error = None;
         let start = self.s.cursor();
@@ -94,19 +116,26 @@ impl Lexer<'_> {
             Some('/') if self.s.eat_if('/') => self.line_comment(),
             Some('/') if self.s.eat_if('*') => self.block_comment(),
             Some('*') if self.s.eat_if('/') => {
-                self.error("unexpected end of block comment")
+                let kind = self.error("unexpected end of block comment");
+                self.hint(
+                    "consider escaping the `*` with a backslash or \
+                     opening the block comment with `/*`",
+                );
+                kind
             }
 
             Some(c) => match self.mode {
                 LexMode::Markup => self.markup(start, c),
                 LexMode::Math => self.math(start, c),
                 LexMode::Code => self.code(start, c),
+                LexMode::Raw => unreachable!(),
             },
 
-            None => SyntaxKind::Eof,
+            None => SyntaxKind::End,
         }
     }
 
+    /// Eat whitespace characters greedily.
     fn whitespace(&mut self, start: usize, c: char) -> SyntaxKind {
         let more = self.s.eat_while(|c| is_space(c, self.mode));
         let newlines = match c {
@@ -224,15 +253,23 @@ impl Lexer<'_> {
     }
 
     fn raw(&mut self) -> SyntaxKind {
+        let start = self.s.cursor() - 1;
+        self.raw.clear();
+
+        // Determine number of opening backticks.
         let mut backticks = 1;
         while self.s.eat_if('`') {
             backticks += 1;
         }
 
+        // Special case for ``.
         if backticks == 2 {
-            return SyntaxKind::Raw;
+            self.push_raw(SyntaxKind::RawDelim);
+            self.s.jump(start + 1);
+            return SyntaxKind::RawDelim;
         }
 
+        // Find end of raw text.
         let mut found = 0;
         while found < backticks {
             match self.s.eat() {
@@ -246,12 +283,120 @@ impl Lexer<'_> {
             return self.error("unclosed raw text");
         }
 
-        SyntaxKind::Raw
+        let end = self.s.cursor();
+        if backticks >= 3 {
+            self.blocky_raw(start, end, backticks);
+        } else {
+            self.inline_raw(start, end, backticks);
+        }
+
+        // Closing delimiter.
+        self.push_raw(SyntaxKind::RawDelim);
+
+        // The saved tokens will be removed in reverse.
+        self.raw.reverse();
+
+        // Opening delimiter.
+        self.s.jump(start + backticks);
+        SyntaxKind::RawDelim
+    }
+
+    fn blocky_raw(&mut self, start: usize, end: usize, backticks: usize) {
+        // Language tag.
+        self.s.jump(start + backticks);
+        if self.s.eat_if(is_id_start) {
+            self.s.eat_while(is_id_continue);
+            self.push_raw(SyntaxKind::RawLang);
+        }
+
+        // Determine inner content between backticks.
+        self.s.eat_if(' ');
+        let inner = self.s.to(end - backticks);
+
+        // Determine dedent level.
+        let mut lines = split_newlines(inner);
+        let dedent = lines
+            .iter()
+            .skip(1)
+            .filter(|line| !line.chars().all(char::is_whitespace))
+            // The line with the closing ``` is always taken into account
+            .chain(lines.last())
+            .map(|line| line.chars().take_while(|c| c.is_whitespace()).count())
+            .min()
+            .unwrap_or(0);
+
+        // Trim single space in last line if text ends with a backtick. The last
+        // line is the one directly before the closing backticks and if it is
+        // just whitespace, it will be completely trimmed below.
+        if inner.trim_end().ends_with('`') {
+            if let Some(last) = lines.last_mut() {
+                *last = last.strip_suffix(' ').unwrap_or(last);
+            }
+        }
+
+        let is_whitespace = |line: &&str| line.chars().all(char::is_whitespace);
+        let starts_whitespace = lines.first().is_some_and(is_whitespace);
+        let ends_whitespace = lines.last().is_some_and(is_whitespace);
+
+        let mut lines = lines.into_iter();
+        let mut skipped = false;
+
+        // Trim whitespace + newline at start.
+        if starts_whitespace {
+            self.s.advance(lines.next().unwrap().len());
+            skipped = true;
+        }
+        // Trim whitespace + newline at end.
+        if ends_whitespace {
+            lines.next_back();
+        }
+
+        // Add lines.
+        for (i, line) in lines.enumerate() {
+            let dedent = if i == 0 && !skipped { 0 } else { dedent };
+            let offset: usize = line.chars().take(dedent).map(char::len_utf8).sum();
+            self.s.eat_newline();
+            self.s.advance(offset);
+            self.push_raw(SyntaxKind::RawTrimmed);
+            self.s.advance(line.len() - offset);
+            self.push_raw(SyntaxKind::Text);
+        }
+
+        // Add final trimmed.
+        if self.s.cursor() < end - backticks {
+            self.s.jump(end - backticks);
+            self.push_raw(SyntaxKind::RawTrimmed);
+        }
+        self.s.jump(end);
+    }
+
+    fn inline_raw(&mut self, start: usize, end: usize, backticks: usize) {
+        self.s.jump(start + backticks);
+
+        while self.s.cursor() < end - backticks {
+            if self.s.at(is_newline) {
+                self.push_raw(SyntaxKind::Text);
+                self.s.eat_newline();
+                self.push_raw(SyntaxKind::RawTrimmed);
+                continue;
+            }
+            self.s.eat();
+        }
+        self.push_raw(SyntaxKind::Text);
+
+        self.s.jump(end);
+    }
+
+    /// Push the current cursor that marks the end of a raw segment of
+    /// the given `kind`.
+    fn push_raw(&mut self, kind: SyntaxKind) {
+        let end = self.s.cursor();
+        self.raw.push((kind, end));
     }
 
     fn link(&mut self) -> SyntaxKind {
         let (link, balanced) = link_prefix(self.s.after());
-        self.s.jump(self.s.cursor() + link.len());
+        self.s.advance(link.len());
 
         if !balanced {
             return self.error(
@@ -275,7 +420,7 @@ impl Lexer<'_> {
     }
 
     fn ref_marker(&mut self) -> SyntaxKind {
-        self.s.eat_while(|c| is_id_continue(c) || matches!(c, ':' | '.'));
+        self.s.eat_while(is_valid_in_label_literal);
 
         // Don't include the trailing characters likely to be part of text.
         while matches!(self.s.scout(-1), Some('.' | ':')) {
@@ -286,7 +431,7 @@ impl Lexer<'_> {
     }
 
     fn label(&mut self) -> SyntaxKind {
-        let label = self.s.eat_while(|c| is_id_continue(c) || matches!(c, ':' | '.'));
+        let label = self.s.eat_while(is_valid_in_label_literal);
         if label.is_empty() {
             return self.error("label cannot be empty");
         }
@@ -329,7 +474,7 @@ impl Lexer<'_> {
                 Some('-') if !s.at(['-', '?']) => {}
                 Some('.') if !s.at("..") => {}
                 Some('h') if !s.at("ttp://") && !s.at("ttps://") => {}
-                Some('@') if !s.at(is_id_start) => {}
+                Some('@') if !s.at(is_valid_in_label_literal) => {}
                 _ => break,
             }
 
@@ -341,7 +486,7 @@ impl Lexer<'_> {
 
     fn in_word(&self) -> bool {
         let wordy = |c: Option<char>| {
-            c.map_or(false, |c| {
+            c.is_some_and(|c| {
                 c.is_alphanumeric()
                     && !matches!(
                         c.script(),
@@ -538,7 +683,7 @@ impl Lexer<'_> {
         // Make sure not to confuse a range for the decimal separator.
         if c != '.'
             && !self.s.at("..")
-            && !self.s.scout(1).map_or(false, is_id_start)
+            && !self.s.scout(1).is_some_and(is_id_start)
             && self.s.eat_if('.')
             && base == 10
         {
@@ -616,6 +761,7 @@ fn keyword(ident: &str) -> Option<SyntaxKind> {
         "let" => SyntaxKind::Let,
         "set" => SyntaxKind::Set,
         "show" => SyntaxKind::Show,
+        "context" => SyntaxKind::Context,
         "if" => SyntaxKind::If,
         "else" => SyntaxKind::Else,
         "for" => SyntaxKind::For,
@@ -631,7 +777,26 @@ fn keyword(ident: &str) -> Option<SyntaxKind> {
     })
 }
 
-/// Whether a character will become a Space token in Typst
+trait ScannerExt {
+    fn advance(&mut self, by: usize);
+    fn eat_newline(&mut self) -> bool;
+}
+
+impl ScannerExt for Scanner<'_> {
+    fn advance(&mut self, by: usize) {
+        self.jump(self.cursor() + by);
+    }
+
+    fn eat_newline(&mut self) -> bool {
+        let ate = self.eat_if(is_newline);
+        if ate && self.before().ends_with('\r') {
+            self.eat_if('\n');
+        }
+        ate
+    }
+}
+
+/// Whether a character will become a [`SyntaxKind::Space`] token.
 #[inline]
 fn is_space(character: char, mode: LexMode) -> bool {
     match mode {
@@ -689,7 +854,7 @@ pub fn link_prefix(text: &str) -> (&str, bool) {
     (s.before(), brackets.is_empty())
 }
 
-/// Split text at newlines.
+/// Split text at newlines. These newline characters are not kept.
 pub fn split_newlines(text: &str) -> Vec<&str> {
     let mut s = Scanner::new(text);
     let mut lines = Vec::new();
@@ -739,7 +904,7 @@ pub fn is_ident(string: &str) -> bool {
     let mut chars = string.chars();
     chars
         .next()
-        .map_or(false, |c| is_id_start(c) && chars.all(is_id_continue))
+        .is_some_and(|c| is_id_start(c) && chars.all(is_id_continue))
 }
 
 /// Whether a character can start an identifier.
@@ -764,4 +929,15 @@ fn is_math_id_start(c: char) -> bool {
 #[inline]
 fn is_math_id_continue(c: char) -> bool {
     is_xid_continue(c) && c != '_'
+}
+
+/// Whether a character can be part of a label literal's name.
+#[inline]
+fn is_valid_in_label_literal(c: char) -> bool {
+    is_id_continue(c) || matches!(c, ':' | '.')
+}
+
+/// Returns true if this string is valid in a label literal.
+pub fn is_valid_label_literal_id(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(is_valid_in_label_literal)
 }

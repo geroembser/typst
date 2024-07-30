@@ -2,7 +2,7 @@ use crate::foundations::{func, Cast, Content, Smart, Style, StyleChain};
 use crate::layout::Abs;
 use crate::math::{EquationElem, MathContext};
 use crate::text::TextElem;
-use crate::util::LazyHash;
+use crate::utils::LazyHash;
 
 /// Bold font style in math.
 ///
@@ -289,16 +289,20 @@ pub fn style_for_denominator(styles: StyleChain) -> [LazyHash<Style>; 2] {
 ///
 /// <https://www.w3.org/TR/mathml-core/#new-text-transform-mappings>
 /// <https://en.wikipedia.org/wiki/Mathematical_Alphanumeric_Symbols>
-pub fn styled_char(styles: StyleChain, c: char) -> char {
+pub fn styled_char(styles: StyleChain, c: char, auto_italic: bool) -> char {
     use MathVariant::*;
 
     let variant = EquationElem::variant_in(styles);
     let bold = EquationElem::bold_in(styles);
-    let italic = EquationElem::italic_in(styles).unwrap_or(matches!(
-        c,
-        'a'..='z' | 'ı' | 'ȷ' | 'A'..='Z' | 'α'..='ω' |
-        '∂' | 'ϵ' | 'ϑ' | 'ϰ' | 'ϕ' | 'ϱ' | 'ϖ'
-    ));
+    let italic = EquationElem::italic_in(styles).unwrap_or(
+        auto_italic
+            && matches!(
+                c,
+                'a'..='z' | 'ı' | 'ȷ' | 'A'..='Z' | 'α'..='ω' |
+                '∂' | 'ϵ' | 'ϑ' | 'ϰ' | 'ϕ' | 'ϱ' | 'ϖ'
+            )
+            && matches!(variant, Sans | Serif),
+    );
 
     if let Some(c) = basic_exception(c) {
         return c;
@@ -441,6 +445,11 @@ fn latin_exception(
         ('Q', Bb, ..) => 'ℚ',
         ('R', Bb, ..) => 'ℝ',
         ('Z', Bb, ..) => 'ℤ',
+        ('D', Bb, _, true) => 'ⅅ',
+        ('d', Bb, _, true) => 'ⅆ',
+        ('e', Bb, _, true) => 'ⅇ',
+        ('i', Bb, _, true) => 'ⅈ',
+        ('j', Bb, _, true) => 'ⅉ',
         ('h', Serif, false, true) => 'ℎ',
         ('e', Cal, false, _) => 'ℯ',
         ('g', Cal, false, _) => 'ℊ',
@@ -459,15 +468,20 @@ fn greek_exception(
 ) -> Option<char> {
     use MathVariant::*;
     let list = match c {
-        'ϴ' => ['𝚹', '𝛳', '𝜭', '𝝧', '𝞡'],
-        '∇' => ['𝛁', '𝛻', '𝜵', '𝝯', '𝞩'],
-        '∂' => ['𝛛', '𝜕', '𝝏', '𝞉', '𝟃'],
-        'ϵ' => ['𝛜', '𝜖', '𝝐', '𝞊', '𝟄'],
-        'ϑ' => ['𝛝', '𝜗', '𝝑', '𝞋', '𝟅'],
-        'ϰ' => ['𝛞', '𝜘', '𝝒', '𝞌', '𝟆'],
-        'ϕ' => ['𝛟', '𝜙', '𝝓', '𝞍', '𝟇'],
-        'ϱ' => ['𝛠', '𝜚', '𝝔', '𝞎', '𝟈'],
-        'ϖ' => ['𝛡', '𝜛', '𝝕', '𝞏', '𝟉'],
+        'ϴ' => ['𝚹', '𝛳', '𝜭', '𝝧', '𝞡', 'ϴ'],
+        '∇' => ['𝛁', '𝛻', '𝜵', '𝝯', '𝞩', '∇'],
+        '∂' => ['𝛛', '𝜕', '𝝏', '𝞉', '𝟃', '∂'],
+        'ϵ' => ['𝛜', '𝜖', '𝝐', '𝞊', '𝟄', 'ϵ'],
+        'ϑ' => ['𝛝', '𝜗', '𝝑', '𝞋', '𝟅', 'ϑ'],
+        'ϰ' => ['𝛞', '𝜘', '𝝒', '𝞌', '𝟆', 'ϰ'],
+        'ϕ' => ['𝛟', '𝜙', '𝝓', '𝞍', '𝟇', 'ϕ'],
+        'ϱ' => ['𝛠', '𝜚', '𝝔', '𝞎', '𝟈', 'ϱ'],
+        'ϖ' => ['𝛡', '𝜛', '𝝕', '𝞏', '𝟉', 'ϖ'],
+        'Γ' => ['𝚪', '𝛤', '𝜞', '𝝘', '𝞒', 'ℾ'],
+        'γ' => ['𝛄', '𝛾', '𝜸', '𝝲', '𝞬', 'ℽ'],
+        'Π' => ['𝚷', '𝛱', '𝜫', '𝝥', '𝞟', 'ℿ'],
+        'π' => ['𝛑', '𝜋', '𝝅', '𝝿', '𝞹', 'ℼ'],
+        '∑' => ['∑', '∑', '∑', '∑', '∑', '⅀'],
         _ => return None,
     };
 
@@ -477,6 +491,7 @@ fn greek_exception(
         (Serif, true, true) => list[2],
         (Sans, _, false) => list[3],
         (Sans, _, true) => list[4],
+        (Bb, ..) => list[5],
         _ => return None,
     })
 }

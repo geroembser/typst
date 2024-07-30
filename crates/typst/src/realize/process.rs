@@ -1,20 +1,20 @@
 use std::cell::OnceCell;
 
-use smallvec::smallvec;
+use comemo::{Track, Tracked};
 
 use crate::diag::SourceResult;
 use crate::engine::Engine;
 use crate::foundations::{
-    Content, Packed, Recipe, RecipeIndex, Regex, Selector, Show, ShowSet, Style,
+    Content, Context, Packed, Recipe, RecipeIndex, Regex, Selector, Show, ShowSet, Style,
     StyleChain, Styles, Synthesize, Transformation,
 };
-use crate::introspection::{Locatable, Meta, MetaElem};
+use crate::introspection::{Locatable, SplitLocator, Tag, TagElem};
 use crate::text::TextElem;
-use crate::util::{hash128, BitSet};
+use crate::utils::SmallBitSet;
 
 /// What to do with an element when encountering it during realization.
 struct Verdict<'a> {
-    /// Whether the element is already prepated (i.e. things that should only
+    /// Whether the element is already prepared (i.e. things that should only
     /// happen once have happened).
     prepared: bool,
     /// A map of styles to apply to the element.
@@ -31,18 +31,10 @@ enum ShowStep<'a> {
     Builtin,
 }
 
-/// Whether the `target` element needs processing.
-pub fn processable<'a>(
-    engine: &mut Engine,
-    target: &'a Content,
-    styles: StyleChain<'a>,
-) -> bool {
-    verdict(engine, target, styles).is_some()
-}
-
 /// Processes the given `target` element when encountering it during realization.
 pub fn process(
     engine: &mut Engine,
+    locator: &mut SplitLocator,
     target: &Content,
     styles: StyleChain,
 ) -> SourceResult<Option<Content>> {
@@ -56,9 +48,9 @@ pub fn process(
 
     // If the element isn't yet prepared (we're seeing it for the first time),
     // prepare it.
-    let mut meta = None;
+    let mut tag = None;
     if !prepared {
-        meta = prepare(engine, &mut target, &mut map, styles)?;
+        tag = prepare(engine, locator, &mut target, &mut map, styles)?;
     }
 
     // Apply a step, if there is one.
@@ -70,14 +62,14 @@ pub fn process(
             //
             // This way, we can ignore errors that only occur in earlier
             // iterations and also show more useful errors at once.
-            engine.delayed(|engine| show(engine, target, step, styles.chain(&map)))
+            engine.delay(|engine| show(engine, target, step, styles.chain(&map)))
         }
         None => target,
     };
 
-    // If necessary, apply metadata generated in the preparation.
-    if let Some(meta) = meta {
-        output += meta.pack();
+    // If necessary, add the tag generated in the preparation.
+    if let Some(tag) = tag {
+        output = tag + output;
     }
 
     Ok(Some(output.styled_with_map(map)))
@@ -92,7 +84,7 @@ fn verdict<'a>(
 ) -> Option<Verdict<'a>> {
     let mut target = target;
     let mut map = Styles::new();
-    let mut revoked = BitSet::new();
+    let mut revoked = SmallBitSet::new();
     let mut step = None;
     let mut slot;
 
@@ -176,6 +168,7 @@ fn verdict<'a>(
         && map.is_empty()
         && (prepared || {
             target.label().is_none()
+                && target.location().is_none()
                 && !target.can::<dyn ShowSet>()
                 && !target.can::<dyn Locatable>()
                 && !target.can::<dyn Synthesize>()
@@ -190,16 +183,25 @@ fn verdict<'a>(
 /// This is only executed the first time an element is visited.
 fn prepare(
     engine: &mut Engine,
+    locator: &mut SplitLocator,
     target: &mut Content,
     map: &mut Styles,
     styles: StyleChain,
-) -> SourceResult<Option<Packed<MetaElem>>> {
+) -> SourceResult<Option<Content>> {
     // Generate a location for the element, which uniquely identifies it in
     // the document. This has some overhead, so we only do it for elements
     // that are explicitly marked as locatable and labelled elements.
-    if target.can::<dyn Locatable>() || target.label().is_some() {
-        let location = engine.locator.locate(hash128(&target));
+    //
+    // The element could already have a location even if it is not prepared
+    // when it stems from a query.
+    let mut key = None;
+    if target.location().is_some() {
+        key = Some(crate::utils::hash128(&target));
+    } else if target.can::<dyn Locatable>() || target.label().is_some() {
+        let hash = crate::utils::hash128(&target);
+        let location = locator.next_location(engine.introspector, hash);
         target.set_location(location);
+        key = Some(hash);
     }
 
     // Apply built-in show-set rules. User-defined show-set rules are already
@@ -219,24 +221,18 @@ fn prepare(
     // available in rules.
     target.materialize(styles.chain(map));
 
+    // If the element is locatable, create a tag element to be able to find the
+    // element in the frames after layout. Do this after synthesis and
+    // materialization, so that it includes the synthesized fields. Do it before
+    // marking as prepared so that show-set rules will apply to this element
+    // when queried.
+    let tag = key.map(|key| TagElem::packed(Tag::new(target.clone(), key)));
+
     // Ensure that this preparation only runs once by marking the element as
     // prepared.
     target.mark_prepared();
 
-    // Apply metadata be able to find the element in the frames.
-    // Do this after synthesis, so that it includes the synthesized fields.
-    if target.location().is_some() {
-        // Add a style to the whole element's subtree identifying it as
-        // belonging to the element.
-        map.set(MetaElem::set_data(smallvec![Meta::Elem(target.clone())]));
-
-        // Return an extra meta elem that will be attached so that the metadata
-        // styles are not lost in case the element's show rule results in
-        // nothing.
-        return Ok(Some(Packed::new(MetaElem::new()).spanned(target.span())));
-    }
-
-    Ok(None)
+    Ok(tag)
 }
 
 /// Apply a step.
@@ -248,17 +244,20 @@ fn show(
 ) -> SourceResult<Content> {
     match step {
         // Apply a user-defined show rule.
-        ShowStep::Recipe(recipe, guard) => match &recipe.selector {
-            // If the selector is a regex, the `target` is guaranteed to be a
-            // text element. This invokes special regex handling.
-            Some(Selector::Regex(regex)) => {
-                let text = target.into_packed::<TextElem>().unwrap();
-                show_regex(engine, &text, regex, recipe, guard)
-            }
+        ShowStep::Recipe(recipe, guard) => {
+            let context = Context::new(target.location(), Some(styles));
+            match &recipe.selector {
+                // If the selector is a regex, the `target` is guaranteed to be a
+                // text element. This invokes special regex handling.
+                Some(Selector::Regex(regex)) => {
+                    let text = target.into_packed::<TextElem>().unwrap();
+                    show_regex(engine, &text, regex, recipe, guard, context.track())
+                }
 
-            // Just apply the recipe.
-            _ => recipe.apply(engine, target.guarded(guard)),
-        },
+                // Just apply the recipe.
+                _ => recipe.apply(engine, context.track(), target.guarded(guard)),
+            }
+        }
 
         // If the verdict picks this step, the `target` is guaranteed to have a
         // built-in show rule.
@@ -269,13 +268,14 @@ fn show(
 /// Apply a regex show rule recipe to a target.
 fn show_regex(
     engine: &mut Engine,
-    elem: &Packed<TextElem>,
+    target: &Packed<TextElem>,
     regex: &Regex,
     recipe: &Recipe,
     index: RecipeIndex,
+    context: Tracked<Context>,
 ) -> SourceResult<Content> {
     let make = |s: &str| {
-        let mut fresh = elem.clone();
+        let mut fresh = target.clone();
         fresh.push_text(s.into());
         fresh.pack()
     };
@@ -283,16 +283,16 @@ fn show_regex(
     let mut result = vec![];
     let mut cursor = 0;
 
-    let text = elem.text();
+    let text = target.text();
 
-    for m in regex.find_iter(elem.text()) {
+    for m in regex.find_iter(target.text()) {
         let start = m.start();
         if cursor < start {
             result.push(make(&text[cursor..start]));
         }
 
         let piece = make(m.as_str());
-        let transformed = recipe.apply(engine, piece)?;
+        let transformed = recipe.apply(engine, context, piece)?;
         result.push(transformed);
         cursor = m.end();
     }

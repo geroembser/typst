@@ -1,10 +1,11 @@
+use comemo::Track;
 use ecow::eco_format;
 
 use crate::diag::{bail, At, Hint, SourceResult};
 use crate::engine::Engine;
 use crate::foundations::{
-    cast, elem, Content, Func, IntoValue, Label, NativeElement, Packed, Show, Smart,
-    StyleChain, Synthesize,
+    cast, elem, Content, Context, Func, IntoValue, Label, NativeElement, Packed, Show,
+    Smart, StyleChain, Synthesize,
 };
 use crate::introspection::{Counter, Locatable};
 use crate::math::EquationElem;
@@ -18,8 +19,7 @@ use crate::text::TextElem;
 /// Produces a textual reference to a label. For example, a reference to a
 /// heading will yield an appropriate string such as "Section 1" for a reference
 /// to the first heading. The references are also links to the respective
-/// element. Reference syntax can also be used to [cite]($cite) from a
-/// bibliography.
+/// element. Reference syntax can also be used to [cite] from a bibliography.
 ///
 /// Referenceable elements include [headings]($heading), [figures]($figure),
 /// [equations]($math.equation), and [footnotes]($footnote). To create a custom
@@ -28,7 +28,7 @@ use crate::text::TextElem;
 /// might be a more direct way to define a custom referenceable element.
 ///
 /// If you just want to link to a labelled element and not get an automatic
-/// textual reference, consider using the [`link`]($link) function instead.
+/// textual reference, consider using the [`link`] function instead.
 ///
 /// # Example
 /// ```example
@@ -77,10 +77,10 @@ use crate::text::TextElem;
 ///   let el = it.element
 ///   if el != none and el.func() == eq {
 ///     // Override equation references.
-///     numbering(
+///     link(el.location(),numbering(
 ///       el.numbering,
 ///       ..counter(eq).at(el.location())
-///     )
+///     ))
 ///   } else {
 ///     // Other references as usual.
 ///     it
@@ -96,7 +96,7 @@ pub struct RefElem {
     /// The target label that should be referenced.
     ///
     /// Can be a label that is defined in the document or an entry from the
-    /// [`bibliography`]($bibliography).
+    /// [`bibliography`].
     #[required]
     pub target: Label,
 
@@ -177,8 +177,8 @@ impl Show for Packed<RefElem> {
 
         let elem = elem.at(span)?;
 
-        if elem.func() == FootnoteElem::elem() {
-            return Ok(FootnoteElem::with_label(target).pack().spanned(span));
+        if let Some(footnote) = elem.to_packed::<FootnoteElem>() {
+            return Ok(footnote.into_ref(target).pack().spanned(span));
         }
 
         let elem = elem.clone();
@@ -213,15 +213,19 @@ impl Show for Packed<RefElem> {
             .at(span)?;
 
         let loc = elem.location().unwrap();
-        let numbers = refable
-            .counter()
-            .at(engine, loc)?
-            .display(engine, &numbering.clone().trimmed())?;
+        let numbers = refable.counter().display_at_loc(
+            engine,
+            loc,
+            styles,
+            &numbering.clone().trimmed(),
+        )?;
 
         let supplement = match self.supplement(styles).as_ref() {
             Smart::Auto => refable.supplement(),
             Smart::Custom(None) => Content::empty(),
-            Smart::Custom(Some(supplement)) => supplement.resolve(engine, [elem])?,
+            Smart::Custom(Some(supplement)) => {
+                supplement.resolve(engine, styles, [elem])?
+            }
         };
 
         let mut content = numbers;
@@ -267,11 +271,14 @@ impl Supplement {
     pub fn resolve<T: IntoValue>(
         &self,
         engine: &mut Engine,
+        styles: StyleChain,
         args: impl IntoIterator<Item = T>,
     ) -> SourceResult<Content> {
         Ok(match self {
             Supplement::Content(content) => content.clone(),
-            Supplement::Func(func) => func.call(engine, args)?.display(),
+            Supplement::Func(func) => func
+                .call(engine, Context::new(None, Some(styles)).track(), args)?
+                .display(),
         })
     }
 }

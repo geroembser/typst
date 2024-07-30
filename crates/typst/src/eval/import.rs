@@ -1,14 +1,12 @@
 use comemo::TrackedMut;
 use ecow::{eco_format, eco_vec, EcoString};
-use serde::{Deserialize, Serialize};
 
-use crate::diag::{
-    bail, error, warning, At, FileError, SourceResult, StrResult, Trace, Tracepoint,
-};
+use crate::diag::{bail, error, warning, At, FileError, SourceResult, Trace, Tracepoint};
 use crate::eval::{eval, Eval, Vm};
 use crate::foundations::{Content, Module, Value};
 use crate::syntax::ast::{self, AstNode};
-use crate::syntax::{FileId, PackageSpec, PackageVersion, Span, VirtualPath};
+use crate::syntax::package::{PackageManifest, PackageSpec};
+use crate::syntax::{FileId, Span, VirtualPath};
 use crate::World;
 
 impl Eval for ast::ModuleImport<'_> {
@@ -33,11 +31,11 @@ impl Eval for ast::ModuleImport<'_> {
             }
         }
 
-        if let Some(new_name) = &new_name {
+        if let Some(new_name) = new_name {
             if let ast::Expr::Ident(ident) = self.source() {
                 if ident.as_str() == new_name.as_str() {
                     // Warn on `import x as x`
-                    vm.engine.tracer.warn(warning!(
+                    vm.engine.sink.warn(warning!(
                         new_name.span(),
                         "unnecessary import rename to same name",
                     ));
@@ -45,7 +43,7 @@ impl Eval for ast::ModuleImport<'_> {
             }
 
             // Define renamed module on the scope.
-            vm.scopes.top.define(new_name.as_str(), source.clone());
+            vm.scopes.top.define_ident(new_name, source.clone());
         }
 
         let scope = source.scope().unwrap();
@@ -58,30 +56,69 @@ impl Eval for ast::ModuleImport<'_> {
                 }
             }
             Some(ast::Imports::Wildcard) => {
-                for (var, value) in scope.iter() {
-                    vm.scopes.top.define(var.clone(), value.clone());
+                for (var, value, span) in scope.iter() {
+                    vm.scopes.top.define_spanned(var.clone(), value.clone(), span);
                 }
             }
             Some(ast::Imports::Items(items)) => {
                 let mut errors = eco_vec![];
                 for item in items.iter() {
-                    let original_ident = item.original_name();
-                    if let Some(value) = scope.get(&original_ident) {
-                        // Warn on `import ...: x as x`
-                        if let ast::ImportItem::Renamed(renamed_item) = &item {
-                            if renamed_item.original_name().as_str()
-                                == renamed_item.new_name().as_str()
-                            {
-                                vm.engine.tracer.warn(warning!(
-                                    renamed_item.new_name().span(),
-                                    "unnecessary import rename to same name",
-                                ));
-                            }
-                        }
+                    let mut path = item.path().iter().peekable();
+                    let mut scope = scope;
 
-                        vm.define(item.bound_name(), value.clone());
-                    } else {
-                        errors.push(error!(original_ident.span(), "unresolved import"));
+                    while let Some(component) = &path.next() {
+                        let Some(value) = scope.get(component) else {
+                            errors.push(error!(component.span(), "unresolved import"));
+                            break;
+                        };
+
+                        if path.peek().is_some() {
+                            // Nested import, as this is not the last component.
+                            // This must be a submodule.
+                            let Some(submodule) = value.scope() else {
+                                let error = if matches!(value, Value::Func(function) if function.scope().is_none())
+                                {
+                                    error!(
+                                        component.span(),
+                                        "cannot import from user-defined functions"
+                                    )
+                                } else if !matches!(
+                                    value,
+                                    Value::Func(_) | Value::Module(_) | Value::Type(_)
+                                ) {
+                                    error!(
+                                        component.span(),
+                                        "expected module, function, or type, found {}",
+                                        value.ty()
+                                    )
+                                } else {
+                                    panic!("unexpected nested import failure")
+                                };
+                                errors.push(error);
+                                break;
+                            };
+
+                            // Walk into the submodule.
+                            scope = submodule;
+                        } else {
+                            // Now that we have the scope of the innermost submodule
+                            // in the import path, we may extract the desired item from
+                            // it.
+
+                            // Warn on `import ...: x as x`
+                            if let ast::ImportItem::Renamed(renamed_item) = &item {
+                                if renamed_item.original_name().as_str()
+                                    == renamed_item.new_name().as_str()
+                                {
+                                    vm.engine.sink.warn(warning!(
+                                        renamed_item.new_name().span(),
+                                        "unnecessary import rename to same name",
+                                    ));
+                                }
+                            }
+
+                            vm.define(item.bound_name(), value.clone());
+                        }
                     }
                 }
                 if !errors.is_empty() {
@@ -136,7 +173,10 @@ fn import_package(vm: &mut Vm, spec: PackageSpec, span: Span) -> SourceResult<Mo
     // Evaluate the manifest.
     let manifest_id = FileId::new(Some(spec.clone()), VirtualPath::new("typst.toml"));
     let bytes = vm.world().file(manifest_id).at(span)?;
-    let manifest = PackageManifest::parse(&bytes).at(span)?;
+    let string = std::str::from_utf8(&bytes).map_err(FileError::from).at(span)?;
+    let manifest: PackageManifest = toml::from_str(string)
+        .map_err(|err| eco_format!("package manifest is malformed ({})", err.message()))
+        .at(span)?;
     manifest.validate(&spec).at(span)?;
 
     // Evaluate the entry point.
@@ -145,8 +185,9 @@ fn import_package(vm: &mut Vm, spec: PackageSpec, span: Span) -> SourceResult<Mo
     let point = || Tracepoint::Import;
     Ok(eval(
         vm.world(),
+        vm.engine.traced,
+        TrackedMut::reborrow_mut(&mut vm.engine.sink),
         vm.engine.route.track(),
-        TrackedMut::reborrow_mut(&mut vm.engine.tracer),
         &source,
     )
     .trace(vm.world(), point, span)?
@@ -169,67 +210,10 @@ fn import_file(vm: &mut Vm, path: &str, span: Span) -> SourceResult<Module> {
     let point = || Tracepoint::Import;
     eval(
         world,
+        vm.engine.traced,
+        TrackedMut::reborrow_mut(&mut vm.engine.sink),
         vm.engine.route.track(),
-        TrackedMut::reborrow_mut(&mut vm.engine.tracer),
         &source,
     )
     .trace(world, point, span)
-}
-
-/// A parsed package manifest.
-#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
-struct PackageManifest {
-    /// Details about the package itself.
-    package: PackageInfo,
-}
-
-/// The `package` key in the manifest.
-///
-/// More fields are specified, but they are not relevant to the compiler.
-#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
-struct PackageInfo {
-    /// The name of the package within its namespace.
-    name: EcoString,
-    /// The package's version.
-    version: PackageVersion,
-    /// The path of the entrypoint into the package.
-    entrypoint: EcoString,
-    /// The minimum required compiler version for the package.
-    compiler: Option<PackageVersion>,
-}
-
-impl PackageManifest {
-    /// Parse the manifest from raw bytes.
-    fn parse(bytes: &[u8]) -> StrResult<Self> {
-        let string = std::str::from_utf8(bytes).map_err(FileError::from)?;
-        toml::from_str(string).map_err(|err| {
-            eco_format!("package manifest is malformed: {}", err.message())
-        })
-    }
-
-    /// Ensure that this manifest is indeed for the specified package.
-    fn validate(&self, spec: &PackageSpec) -> StrResult<()> {
-        if self.package.name != spec.name {
-            bail!("package manifest contains mismatched name `{}`", self.package.name);
-        }
-
-        if self.package.version != spec.version {
-            bail!(
-                "package manifest contains mismatched version {}",
-                self.package.version
-            );
-        }
-
-        if let Some(compiler) = self.package.compiler {
-            let current = PackageVersion::compiler();
-            if current < compiler {
-                bail!(
-                    "package requires typst {compiler} or newer \
-                     (current version is {current})"
-                );
-            }
-        }
-
-        Ok(())
-    }
 }

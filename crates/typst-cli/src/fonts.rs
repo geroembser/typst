@@ -12,7 +12,7 @@ use crate::args::FontsCommand;
 /// Execute a font listing command.
 pub fn fonts(command: &FontsCommand) -> StrResult<()> {
     let mut searcher = FontSearcher::new();
-    searcher.search(&command.font_paths);
+    searcher.search(&command.font_args.font_paths, command.font_args.ignore_system_fonts);
 
     for (name, infos) in searcher.book.families() {
         println!("{name}");
@@ -66,7 +66,7 @@ impl FontSearcher {
     }
 
     /// Search everything that is available.
-    pub fn search(&mut self, font_paths: &[PathBuf]) {
+    pub fn search(&mut self, font_paths: &[PathBuf], ignore_system_fonts: bool) {
         let mut db = Database::new();
 
         // Font paths have highest priority.
@@ -74,8 +74,10 @@ impl FontSearcher {
             db.load_fonts_dir(path);
         }
 
-        // System fonts have second priority.
-        db.load_system_fonts();
+        if !ignore_system_fonts {
+            // System fonts have second priority.
+            db.load_system_fonts();
+        }
 
         for face in db.faces() {
             let path = match &face.source {
@@ -107,8 +109,8 @@ impl FontSearcher {
     /// Add fonts that are embedded in the binary.
     #[cfg(feature = "embed-fonts")]
     fn add_embedded(&mut self) {
-        let mut process = |bytes: &'static [u8]| {
-            let buffer = typst::foundations::Bytes::from_static(bytes);
+        for data in typst_assets::fonts() {
+            let buffer = typst::foundations::Bytes::from_static(data);
             for (i, font) in Font::iter(buffer).enumerate() {
                 self.book.push(font.info().clone());
                 self.fonts.push(FontSlot {
@@ -117,28 +119,6 @@ impl FontSearcher {
                     font: OnceLock::from(Some(font)),
                 });
             }
-        };
-
-        macro_rules! add {
-            ($filename:literal) => {
-                process(include_bytes!(concat!("../../../assets/fonts/", $filename)));
-            };
         }
-
-        // Embed default fonts.
-        add!("LinLibertine_R.ttf");
-        add!("LinLibertine_RB.ttf");
-        add!("LinLibertine_RBI.ttf");
-        add!("LinLibertine_RI.ttf");
-        add!("NewCMMath-Book.otf");
-        add!("NewCMMath-Regular.otf");
-        add!("NewCM10-Regular.otf");
-        add!("NewCM10-Bold.otf");
-        add!("NewCM10-Italic.otf");
-        add!("NewCM10-BoldItalic.otf");
-        add!("DejaVuSansMono.ttf");
-        add!("DejaVuSansMono-Bold.ttf");
-        add!("DejaVuSansMono-Oblique.ttf");
-        add!("DejaVuSansMono-BoldOblique.ttf");
     }
 }

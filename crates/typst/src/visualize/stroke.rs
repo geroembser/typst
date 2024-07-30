@@ -1,12 +1,12 @@
 use ecow::EcoString;
 
-use crate::diag::{SourceResult, StrResult};
+use crate::diag::{HintedStrResult, SourceResult};
 use crate::foundations::{
     cast, dict, func, scope, ty, Args, Cast, Dict, Fold, FromValue, NoneValue, Repr,
     Resolve, Smart, StyleChain, Value,
 };
 use crate::layout::{Abs, Length};
-use crate::util::{Numeric, Scalar};
+use crate::utils::{Numeric, Scalar};
 use crate::visualize::{Color, Gradient, Paint, Pattern};
 
 /// Defines how to draw a line.
@@ -39,10 +39,9 @@ use crate::visualize::{Color, Gradient, Paint, Pattern};
 /// - A stroke combined from color and thickness using the `+` operator as in
 ///   `{2pt + red}`.
 ///
-/// For full control, you can also provide a [dictionary]($dictionary) or a
-/// `{stroke}` object to any function that expects a stroke. The dictionary's
-/// keys may include any of the parameters for the constructor function, shown
-/// below.
+/// For full control, you can also provide a [dictionary] or a `{stroke}` object
+/// to any function that expects a stroke. The dictionary's keys may include any
+/// of the parameters for the constructor function, shown below.
 ///
 /// # Fields
 /// On a stroke object, you can access any of the fields listed in the
@@ -139,11 +138,12 @@ impl Stroke {
         ///   - `{"dash-dotted"}`
         ///   - `{"densely-dash-dotted"}`
         ///   - `{"loosely-dash-dotted"}`
-        /// - An [array]($array) with alternating lengths for dashes and gaps. You can
-        ///   also use the string `{"dot"}` for a length equal to the line thickness.
-        /// - A [dictionary]($dictionary) with the keys `array` (same as the array
-        ///   above), and `phase` (of type [length]($length)), which defines where in
-        ///   the pattern to start drawing.
+        /// - An [array] with alternating lengths for dashes and gaps. You can
+        ///   also use the string `{"dot"}` for a length equal to the line
+        ///   thickness.
+        /// - A [dictionary] with the keys `array` (same as the array above),
+        ///   and `phase` (of type [length]), which defines where in the pattern
+        ///   to start drawing.
         ///
         /// If set to `{auto}`, the value is inherited, defaulting to `{none}`.
         ///
@@ -378,7 +378,7 @@ cast! {
     },
     mut dict: Dict => {
         // Get a value by key, accepting either Auto or something convertible to type T.
-        fn take<T: FromValue>(dict: &mut Dict, key: &str) -> StrResult<Smart<T>> {
+        fn take<T: FromValue>(dict: &mut Dict, key: &str) -> HintedStrResult<Smart<T>> {
             Ok(dict.take(key).ok().map(Smart::<T>::from_value)
                 .transpose()?.unwrap_or(Smart::Auto))
         }

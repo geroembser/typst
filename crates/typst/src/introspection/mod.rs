@@ -1,6 +1,8 @@
 //! Interaction between document parts.
 
 mod counter;
+#[path = "here.rs"]
+mod here_;
 mod introspector;
 #[path = "locate.rs"]
 mod locate_;
@@ -12,6 +14,7 @@ mod query_;
 mod state;
 
 pub use self::counter::*;
+pub use self::here_::*;
 pub use self::introspector::*;
 pub use self::locate_::*;
 pub use self::location::*;
@@ -22,14 +25,12 @@ pub use self::state::*;
 
 use std::fmt::{self, Debug, Formatter};
 
-use ecow::{eco_format, EcoString};
-use smallvec::SmallVec;
-
-use crate::foundations::Packed;
+use crate::diag::{bail, SourceResult};
+use crate::engine::Engine;
 use crate::foundations::{
-    category, elem, ty, Category, Content, Repr, Scope, Unlabellable,
+    category, elem, Args, Category, Construct, Content, NativeElement, Packed, Scope,
+    Unlabellable,
 };
-use crate::model::Destination;
 use crate::realize::{Behave, Behaviour};
 
 /// Interactions between document parts.
@@ -39,6 +40,9 @@ use crate::realize::{Behave, Behaviour};
 /// equation counters or create custom ones. Meanwhile, the `query` function
 /// lets you search for elements in the document to construct things like a list
 /// of figures or headers which show the current chapter title.
+///
+/// Most of the functions are _contextual._ It is recommended to read the chapter
+/// on [context] before continuing here.
 #[category]
 pub static INTROSPECTION: Category;
 
@@ -49,63 +53,69 @@ pub fn define(global: &mut Scope) {
     global.define_type::<Counter>();
     global.define_type::<State>();
     global.define_elem::<MetadataElem>();
-    global.define_func::<locate>();
+    global.define_func::<here>();
     global.define_func::<query>();
+    global.define_func::<locate>();
 }
 
-/// Hosts metadata and ensures metadata is produced even for empty elements.
-#[elem(Behave, Unlabellable)]
-pub struct MetaElem {
-    /// Metadata that should be attached to all elements affected by this style
-    /// property.
-    ///
-    /// This must be accessed and applied to all frames produced by elements
-    /// that manually handle styles (because their children can have varying
-    /// styles). This currently includes flow, par, and equation.
-    ///
-    /// Other elements don't manually need to handle it because their parents
-    /// that result from realization will take care of it and the metadata can
-    /// only apply to them as a whole, not part of it (because they don't manage
-    /// styles).
-    #[fold]
-    pub data: SmallVec<[Meta; 1]>,
+/// Holds a tag for a locatable element that was realized.
+///
+/// The `TagElem` is handled by all layouters. The held element becomes
+/// available for introspection in the next compiler iteration.
+#[elem(Behave, Unlabellable, Construct)]
+pub struct TagElem {
+    /// The introspectible element.
+    #[required]
+    #[internal]
+    pub tag: Tag,
 }
 
-impl Unlabellable for Packed<MetaElem> {}
+impl TagElem {
+    /// Create a packed tag element.
+    pub fn packed(tag: Tag) -> Content {
+        let mut content = Self::new(tag).pack();
+        // We can skip preparation for the `TagElem`.
+        content.mark_prepared();
+        content
+    }
+}
 
-impl Behave for Packed<MetaElem> {
+impl Construct for TagElem {
+    fn construct(_: &mut Engine, args: &mut Args) -> SourceResult<Content> {
+        bail!(args.span, "cannot be constructed manually")
+    }
+}
+
+impl Unlabellable for Packed<TagElem> {}
+
+impl Behave for Packed<TagElem> {
     fn behaviour(&self) -> Behaviour {
         Behaviour::Invisible
     }
 }
 
-/// Meta information that isn't visible or renderable.
-#[ty]
+/// Holds a locatable element that was realized.
 #[derive(Clone, PartialEq, Hash)]
-pub enum Meta {
-    /// An internal or external link to a destination.
-    Link(Destination),
-    /// An identifiable element that produces something within the area this
-    /// metadata is attached to.
-    Elem(Content),
-    /// Indicates that content should be hidden. This variant doesn't appear
-    /// in the final frames as it is removed alongside the content that should
-    /// be hidden.
-    Hide,
+pub struct Tag {
+    /// The introspectible element.
+    pub elem: Content,
+    /// The element's key hash, which forms the base of its location (but is
+    /// locally disambiguated and combined with outer hashes).
+    ///
+    /// We need to retain this for introspector-assisted location assignment
+    /// during measurement.
+    pub(crate) key: u128,
 }
 
-impl Debug for Meta {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        match self {
-            Self::Link(dest) => write!(f, "Link({dest:?})"),
-            Self::Elem(content) => write!(f, "Elem({:?})", content.func()),
-            Self::Hide => f.pad("Hide"),
-        }
+impl Tag {
+    /// Create a tag from an element and its key hash.
+    pub fn new(elem: Content, key: u128) -> Self {
+        Self { elem, key }
     }
 }
 
-impl Repr for Meta {
-    fn repr(&self) -> EcoString {
-        eco_format!("{self:?}")
+impl Debug for Tag {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "Tag({:?})", self.elem.elem().name())
     }
 }

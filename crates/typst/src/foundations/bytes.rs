@@ -8,7 +8,7 @@ use serde::{Serialize, Serializer};
 
 use crate::diag::{bail, StrResult};
 use crate::foundations::{cast, func, scope, ty, Array, Reflect, Repr, Str, Value};
-use crate::util::LazyHash;
+use crate::utils::LazyHash;
 
 /// A sequence of bytes.
 ///
@@ -17,10 +17,10 @@ use crate::util::LazyHash;
 /// using a [for loop]($scripting/#loops).
 ///
 /// You can convert
-/// - a [string]($str) or an [array]($array) of integers to bytes with the
-///   [`bytes`]($bytes) constructor
-/// - bytes to a string with the [`str`]($str) constructor, with UTF-8 encoding
-/// - bytes to an array of integers with the [`array`]($array) constructor
+/// - a [string]($str) or an [array] of integers to bytes with the [`bytes`]
+///   constructor
+/// - bytes to a string with the [`str`] constructor, with UTF-8 encoding
+/// - bytes to an array of integers with the [`array`] constructor
 ///
 /// When [reading]($read) data from a file, you can decide whether to load it
 /// as a string or as raw bytes.
@@ -127,7 +127,7 @@ impl Bytes {
             .ok_or_else(|| out_of_bounds_no_default(index, self.len()))
     }
 
-    /// Extracts a subslice of the bytes. Fails with an error if the start or
+    /// Extracts a subslice of the bytes. Fails with an error if the start or end
     /// index is out of bounds.
     #[func]
     pub fn slice(

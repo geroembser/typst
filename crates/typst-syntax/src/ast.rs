@@ -8,9 +8,7 @@ use std::ops::Deref;
 use ecow::EcoString;
 use unscanny::Scanner;
 
-use crate::{
-    is_id_continue, is_id_start, is_newline, split_newlines, Span, SyntaxKind, SyntaxNode,
-};
+use crate::{is_newline, Span, SyntaxKind, SyntaxNode};
 
 /// A typed AST node.
 pub trait AstNode<'a>: Sized {
@@ -25,12 +23,6 @@ pub trait AstNode<'a>: Sized {
         self.to_untyped().span()
     }
 }
-
-/// A static syntax node used as a fallback value. This is returned instead of
-/// panicking when the syntactical structure isn't valid. In a normal
-/// compilation, evaluation isn't attempted on a broken file, but for IDE
-/// functionality, it is.
-static ARBITRARY: SyntaxNode = SyntaxNode::arbitrary();
 
 macro_rules! node {
     ($(#[$attr:meta])* $name:ident) => {
@@ -58,7 +50,9 @@ macro_rules! node {
         impl Default for $name<'_> {
             #[inline]
             fn default() -> Self {
-                Self(&ARBITRARY)
+                static PLACEHOLDER: SyntaxNode
+                    = SyntaxNode::placeholder(SyntaxKind::$name);
+                Self(&PLACEHOLDER)
             }
         }
     };
@@ -181,12 +175,14 @@ pub enum Expr<'a> {
     Closure(Closure<'a>),
     /// A let binding: `let x = 1`.
     Let(LetBinding<'a>),
-    //// A destructuring assignment: `(x, y) = (1, 2)`.
+    /// A destructuring assignment: `(x, y) = (1, 2)`.
     DestructAssign(DestructAssignment<'a>),
     /// A set rule: `set text(...)`.
     Set(SetRule<'a>),
     /// A show rule: `show heading: it => emph(it.body)`.
     Show(ShowRule<'a>),
+    /// A contextual expression: `context text.lang`.
+    Contextual(Contextual<'a>),
     /// An if-else conditional: `if x { y } else { z }`.
     Conditional(Conditional<'a>),
     /// A while loop: `while x { y }`.
@@ -264,6 +260,7 @@ impl<'a> AstNode<'a> for Expr<'a> {
             SyntaxKind::DestructAssignment => node.cast().map(Self::DestructAssign),
             SyntaxKind::SetRule => node.cast().map(Self::Set),
             SyntaxKind::ShowRule => node.cast().map(Self::Show),
+            SyntaxKind::Contextual => node.cast().map(Self::Contextual),
             SyntaxKind::Conditional => node.cast().map(Self::Conditional),
             SyntaxKind::WhileLoop => node.cast().map(Self::While),
             SyntaxKind::ForLoop => node.cast().map(Self::For),
@@ -326,6 +323,7 @@ impl<'a> AstNode<'a> for Expr<'a> {
             Self::DestructAssign(v) => v.to_untyped(),
             Self::Set(v) => v.to_untyped(),
             Self::Show(v) => v.to_untyped(),
+            Self::Contextual(v) => v.to_untyped(),
             Self::Conditional(v) => v.to_untyped(),
             Self::While(v) => v.to_untyped(),
             Self::For(v) => v.to_untyped(),
@@ -361,6 +359,7 @@ impl Expr<'_> {
                 | Self::Let(_)
                 | Self::Set(_)
                 | Self::Show(_)
+                | Self::Contextual(_)
                 | Self::Conditional(_)
                 | Self::While(_)
                 | Self::For(_)
@@ -389,7 +388,7 @@ impl Expr<'_> {
 
 impl Default for Expr<'_> {
     fn default() -> Self {
-        Expr::Space(Space::default())
+        Expr::None(None::default())
     }
 }
 
@@ -553,84 +552,48 @@ node! {
 }
 
 impl<'a> Raw<'a> {
-    /// The trimmed raw text.
-    pub fn text(self) -> EcoString {
-        let mut text = self.0.text().as_str();
-        let blocky = text.starts_with("```");
-        text = text.trim_matches('`');
-
-        // Trim tag, one space at the start, and one space at the end if the
-        // last non-whitespace char is a backtick.
-        if blocky {
-            let mut s = Scanner::new(text);
-            if s.eat_if(is_id_start) {
-                s.eat_while(is_id_continue);
-            }
-            text = s.after();
-            text = text.strip_prefix(' ').unwrap_or(text);
-            if text.trim_end().ends_with('`') {
-                text = text.strip_suffix(' ').unwrap_or(text);
-            }
-        }
-
-        // Split into lines.
-        let mut lines = split_newlines(text);
-
-        if blocky {
-            let dedent = lines
-                .iter()
-                .skip(1)
-                .filter(|line| !line.chars().all(char::is_whitespace))
-                // The line with the closing ``` is always taken into account
-                .chain(lines.last())
-                .map(|line| line.chars().take_while(|c| c.is_whitespace()).count())
-                .min()
-                .unwrap_or(0);
-
-            // Dedent based on column, but not for the first line.
-            for line in lines.iter_mut().skip(1) {
-                let offset = line.chars().take(dedent).map(char::len_utf8).sum();
-                *line = &line[offset..];
-            }
-
-            let is_whitespace = |line: &&str| line.chars().all(char::is_whitespace);
-
-            // Trims a sequence of whitespace followed by a newline at the start.
-            if lines.first().map_or(false, is_whitespace) {
-                lines.remove(0);
-            }
-
-            // Trims a newline followed by a sequence of whitespace at the end.
-            if lines.last().map_or(false, is_whitespace) {
-                lines.pop();
-            }
-        }
-
-        lines.join("\n").into()
+    /// The lines in the raw block.
+    pub fn lines(self) -> impl DoubleEndedIterator<Item = Text<'a>> {
+        self.0.children().filter_map(SyntaxNode::cast)
     }
 
     /// An optional identifier specifying the language to syntax-highlight in.
-    pub fn lang(self) -> Option<&'a str> {
-        let text = self.0.text();
-
+    pub fn lang(self) -> Option<RawLang<'a>> {
         // Only blocky literals are supposed to contain a language.
-        if !text.starts_with("```") {
+        let delim: RawDelim = self.0.cast_first_match()?;
+        if delim.0.len() < 3 {
             return Option::None;
         }
 
-        let inner = text.trim_start_matches('`');
-        let mut s = Scanner::new(inner);
-        s.eat_if(is_id_start).then(|| {
-            s.eat_while(is_id_continue);
-            s.before()
-        })
+        self.0.cast_first_match()
     }
 
     /// Whether the raw text should be displayed in a separate block.
     pub fn block(self) -> bool {
-        let text = self.0.text();
-        text.starts_with("```") && text.chars().any(is_newline)
+        self.0
+            .cast_first_match()
+            .is_some_and(|delim: RawDelim| delim.0.len() >= 3)
+            && self.0.children().any(|e| {
+                e.kind() == SyntaxKind::RawTrimmed && e.text().chars().any(is_newline)
+            })
     }
+}
+
+node! {
+    /// A language tag at the start of raw element: ``typ ``.
+    RawLang
+}
+
+impl<'a> RawLang<'a> {
+    /// Get the language tag.
+    pub fn get(self) -> &'a EcoString {
+        self.0.text()
+    }
+}
+
+node! {
+    /// A raw delimiter in single or 3+ backticks: `` ` ``.
+    RawDelim
 }
 
 node! {
@@ -690,7 +653,7 @@ impl<'a> Heading<'a> {
     }
 
     /// The section depth (number of equals signs).
-    pub fn level(self) -> NonZeroUsize {
+    pub fn depth(self) -> NonZeroUsize {
         self.0
             .children()
             .find(|node| node.kind() == SyntaxKind::HeadingMarker)
@@ -877,6 +840,7 @@ node! {
 }
 
 impl MathPrimes<'_> {
+    /// The number of grouped primes.
     pub fn count(self) -> usize {
         self.0
             .children()
@@ -1304,7 +1268,7 @@ node! {
 }
 
 impl<'a> Spread<'a> {
-    /// The spreaded expression.
+    /// The spread expression.
     ///
     /// This should only be accessed if this `Spread` is contained in an
     /// `ArrayItem`, `DictItem`, or `Arg`.
@@ -1947,6 +1911,18 @@ impl<'a> ShowRule<'a> {
 }
 
 node! {
+    /// A contextual expression: `context text.lang`.
+    Contextual
+}
+
+impl<'a> Contextual<'a> {
+    /// The expression which depends on the context.
+    pub fn body(self) -> Expr<'a> {
+        self.0.cast_first_match().unwrap_or_default()
+    }
+}
+
+node! {
     /// An if-else conditional: `if x { y } else { z }`.
     Conditional
 }
@@ -2064,9 +2040,26 @@ impl<'a> ImportItems<'a> {
     pub fn iter(self) -> impl DoubleEndedIterator<Item = ImportItem<'a>> {
         self.0.children().filter_map(|child| match child.kind() {
             SyntaxKind::RenamedImportItem => child.cast().map(ImportItem::Renamed),
-            SyntaxKind::Ident => child.cast().map(ImportItem::Simple),
+            SyntaxKind::ImportItemPath => child.cast().map(ImportItem::Simple),
             _ => Option::None,
         })
+    }
+}
+
+node! {
+    /// A path to a submodule's imported name: `a.b.c`.
+    ImportItemPath
+}
+
+impl<'a> ImportItemPath<'a> {
+    /// An iterator over the path's components.
+    pub fn iter(self) -> impl DoubleEndedIterator<Item = Ident<'a>> {
+        self.0.children().filter_map(SyntaxNode::cast)
+    }
+
+    /// The name of the imported item. This is the last segment in the path.
+    pub fn name(self) -> Ident<'a> {
+        self.iter().last().unwrap_or_default()
     }
 }
 
@@ -2075,18 +2068,26 @@ impl<'a> ImportItems<'a> {
 pub enum ImportItem<'a> {
     /// A non-renamed import (the item's name in the scope is the same as its
     /// name).
-    Simple(Ident<'a>),
+    Simple(ImportItemPath<'a>),
     /// A renamed import (the item was bound to a different name in the scope
     /// than the one it was defined as).
     Renamed(RenamedImportItem<'a>),
 }
 
 impl<'a> ImportItem<'a> {
+    /// The path to the imported item.
+    pub fn path(self) -> ImportItemPath<'a> {
+        match self {
+            Self::Simple(path) => path,
+            Self::Renamed(renamed_item) => renamed_item.path(),
+        }
+    }
+
     /// The original name of the imported item, at its source. This will be the
     /// equal to the bound name if the item wasn't renamed with 'as'.
     pub fn original_name(self) -> Ident<'a> {
         match self {
-            Self::Simple(name) => name,
+            Self::Simple(path) => path.name(),
             Self::Renamed(renamed_item) => renamed_item.original_name(),
         }
     }
@@ -2095,7 +2096,7 @@ impl<'a> ImportItem<'a> {
     /// name, if it was renamed; otherwise, it's just its original name.
     pub fn bound_name(self) -> Ident<'a> {
         match self {
-            Self::Simple(name) => name,
+            Self::Simple(path) => path.name(),
             Self::Renamed(renamed_item) => renamed_item.new_name(),
         }
     }
@@ -2107,9 +2108,14 @@ node! {
 }
 
 impl<'a> RenamedImportItem<'a> {
-    /// The original name of the imported item (`a` in `a as d`).
-    pub fn original_name(self) -> Ident<'a> {
+    /// The path to the imported item.
+    pub fn path(self) -> ImportItemPath<'a> {
         self.0.cast_first_match().unwrap_or_default()
+    }
+
+    /// The original name of the imported item (`a` in `a as d` or `c.b.a as d`).
+    pub fn original_name(self) -> Ident<'a> {
+        self.path().name()
     }
 
     /// The new name of the imported item (`d` in `a as d`).
@@ -2117,7 +2123,7 @@ impl<'a> RenamedImportItem<'a> {
         self.0
             .children()
             .filter_map(SyntaxNode::cast)
-            .nth(1)
+            .last()
             .unwrap_or_default()
     }
 }
@@ -2153,5 +2159,15 @@ impl<'a> FuncReturn<'a> {
     /// The expression to return.
     pub fn body(self) -> Option<Expr<'a>> {
         self.0.cast_last_match()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_expr_default() {
+        assert!(Expr::default().to_untyped().cast::<Expr>().is_some());
     }
 }

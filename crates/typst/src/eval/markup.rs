@@ -8,7 +8,9 @@ use crate::model::{
 };
 use crate::symbols::Symbol;
 use crate::syntax::ast::{self, AstNode};
-use crate::text::{LinebreakElem, RawElem, SmartQuoteElem, SpaceElem, TextElem};
+use crate::text::{
+    LinebreakElem, RawContent, RawElem, SmartQuoteElem, SpaceElem, TextElem,
+};
 
 impl Eval for ast::Markup<'_> {
     type Output = Content;
@@ -43,7 +45,7 @@ fn eval_markup<'a>(
                 }
 
                 let tail = eval_markup(vm, exprs)?;
-                seq.push(tail.styled_with_recipe(&mut vm.engine, recipe)?)
+                seq.push(tail.styled_with_recipe(&mut vm.engine, vm.context, recipe)?)
             }
             expr => match expr.eval(vm)? {
                 Value::Label(label) => {
@@ -105,7 +107,7 @@ impl Eval for ast::Escape<'_> {
     type Output = Value;
 
     fn eval(self, _: &mut Vm) -> SourceResult<Self::Output> {
-        Ok(Value::Symbol(Symbol::single(self.get())))
+        Ok(Value::Symbol(Symbol::single(self.get().into())))
     }
 }
 
@@ -113,7 +115,7 @@ impl Eval for ast::Shorthand<'_> {
     type Output = Value;
 
     fn eval(self, _: &mut Vm) -> SourceResult<Self::Output> {
-        Ok(Value::Symbol(Symbol::single(self.get())))
+        Ok(Value::Symbol(Symbol::single(self.get().into())))
     }
 }
 
@@ -132,7 +134,7 @@ impl Eval for ast::Strong<'_> {
         let body = self.body();
         if body.exprs().next().is_none() {
             vm.engine
-                .tracer
+                .sink
                 .warn(warning!(
                     self.span(), "no text within stars";
                     hint: "using multiple consecutive stars (e.g. **) has no additional effect",
@@ -150,7 +152,7 @@ impl Eval for ast::Emph<'_> {
         let body = self.body();
         if body.exprs().next().is_none() {
             vm.engine
-                .tracer
+                .sink
                 .warn(warning!(
                     self.span(), "no text within underscores";
                     hint: "using multiple consecutive underscores (e.g. __) has no additional effect"
@@ -165,9 +167,10 @@ impl Eval for ast::Raw<'_> {
     type Output = Content;
 
     fn eval(self, _: &mut Vm) -> SourceResult<Self::Output> {
-        let mut elem = RawElem::new(self.text()).with_block(self.block());
+        let lines = self.lines().map(|line| (line.get().clone(), line.span())).collect();
+        let mut elem = RawElem::new(RawContent::Lines(lines)).with_block(self.block());
         if let Some(lang) = self.lang() {
-            elem.push_lang(Some(lang.into()));
+            elem.push_lang(Some(lang.get().clone()));
         }
         Ok(elem.pack())
     }
@@ -208,9 +211,9 @@ impl Eval for ast::Heading<'_> {
     type Output = Content;
 
     fn eval(self, vm: &mut Vm) -> SourceResult<Self::Output> {
-        let level = self.level();
+        let depth = self.depth();
         let body = self.body().eval(vm)?;
-        Ok(HeadingElem::new(body).with_level(level).pack())
+        Ok(HeadingElem::new(body).with_depth(depth).pack())
     }
 }
 

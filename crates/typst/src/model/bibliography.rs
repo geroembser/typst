@@ -19,7 +19,7 @@ use once_cell::sync::Lazy;
 use smallvec::{smallvec, SmallVec};
 use typed_arena::Arena;
 
-use crate::diag::{bail, error, At, FileError, SourceResult, StrResult};
+use crate::diag::{bail, error, At, FileError, HintedStrResult, SourceResult, StrResult};
 use crate::engine::Engine;
 use crate::eval::{eval_string, EvalMode};
 use crate::foundations::{
@@ -29,8 +29,8 @@ use crate::foundations::{
 };
 use crate::introspection::{Introspector, Locatable, Location};
 use crate::layout::{
-    BlockElem, Em, GridCell, GridChild, GridElem, HElem, PadElem, Sizing, TrackSizings,
-    VElem,
+    BlockChild, BlockElem, Em, GridCell, GridChild, GridElem, GridItem, HElem, PadElem,
+    Sizing, TrackSizings, VElem,
 };
 use crate::model::{
     CitationForm, CiteGroup, Destination, FootnoteElem, HeadingElem, LinkElem, ParElem,
@@ -40,7 +40,7 @@ use crate::syntax::{Span, Spanned};
 use crate::text::{
     FontStyle, Lang, LocalName, Region, SubElem, SuperElem, TextElem, WeightDelta,
 };
-use crate::util::{option_eq, LazyHash, NonZeroExt, PicoStr};
+use crate::utils::{LazyHash, NonZeroExt, PicoStr};
 use crate::World;
 
 /// A bibliography / reference listing.
@@ -105,8 +105,7 @@ pub struct BibliographyElem {
     /// The bibliography's heading will not be numbered by default, but you can
     /// force it to be with a show-set rule:
     /// `{show bibliography: set heading(numbering: "1.")}`
-    #[default(Some(Smart::Auto))]
-    pub title: Option<Smart<Content>>,
+    pub title: Smart<Option<Content>>,
 
     /// Whether to include all works from the given bibliography files, even
     /// those that weren't cited in the document.
@@ -151,7 +150,7 @@ cast! {
     BibliographyPaths,
     self => self.0.into_value(),
     v: EcoString => Self(vec![v]),
-    v: Array => Self(v.into_iter().map(Value::cast).collect::<StrResult<_>>()?),
+    v: Array => Self(v.into_iter().map(Value::cast).collect::<HintedStrResult<_>>()?),
 }
 
 impl BibliographyElem {
@@ -213,14 +212,12 @@ impl Show for Packed<BibliographyElem> {
         const INDENT: Em = Em::new(1.5);
 
         let mut seq = vec![];
-        if let Some(title) = self.title(styles) {
-            let title = title.unwrap_or_else(|| {
-                TextElem::packed(Self::local_name_in(styles)).spanned(self.span())
-            });
-
+        if let Some(title) = self.title(styles).unwrap_or_else(|| {
+            Some(TextElem::packed(Self::local_name_in(styles)).spanned(self.span()))
+        }) {
             seq.push(
                 HeadingElem::new(title)
-                    .with_level(NonZeroUsize::ONE)
+                    .with_level(Smart::Custom(NonZeroUsize::ONE))
                     .pack()
                     .spanned(self.span()),
             );
@@ -234,17 +231,17 @@ impl Show for Packed<BibliographyElem> {
             .ok_or("CSL style is not suitable for bibliographies")
             .at(span)?;
 
-        let row_gutter = *BlockElem::below_in(styles).amount();
+        let row_gutter = ParElem::spacing_in(styles).into();
         if references.iter().any(|(prefix, _)| prefix.is_some()) {
             let mut cells = vec![];
             for (prefix, reference) in references {
-                cells.push(GridChild::Cell(
+                cells.push(GridChild::Item(GridItem::Cell(
                     Packed::new(GridCell::new(prefix.clone().unwrap_or_default()))
                         .spanned(span),
-                ));
-                cells.push(GridChild::Cell(
+                )));
+                cells.push(GridChild::Item(GridItem::Cell(
                     Packed::new(GridCell::new(reference.clone())).spanned(span),
-                ));
+                )));
             }
 
             seq.push(VElem::new(row_gutter).with_weakness(3).pack());
@@ -283,41 +280,7 @@ impl ShowSet for Packed<BibliographyElem> {
 }
 
 impl LocalName for Packed<BibliographyElem> {
-    fn local_name(lang: Lang, region: Option<Region>) -> &'static str {
-        match lang {
-            Lang::ALBANIAN => "Bibliografi",
-            Lang::ARABIC => "المراجع",
-            Lang::BOKMÅL => "Bibliografi",
-            Lang::CATALAN => "Bibliografia",
-            Lang::CHINESE if option_eq(region, "TW") => "書目",
-            Lang::CHINESE => "参考文献",
-            Lang::CZECH => "Bibliografie",
-            Lang::DANISH => "Bibliografi",
-            Lang::DUTCH => "Bibliografie",
-            Lang::ESTONIAN => "Viited",
-            Lang::FILIPINO => "Bibliograpiya",
-            Lang::FINNISH => "Viitteet",
-            Lang::FRENCH => "Bibliographie",
-            Lang::GERMAN => "Bibliographie",
-            Lang::GREEK => "Βιβλιογραφία",
-            Lang::HUNGARIAN => "Irodalomjegyzék",
-            Lang::ITALIAN => "Bibliografia",
-            Lang::NYNORSK => "Bibliografi",
-            Lang::POLISH => "Bibliografia",
-            Lang::PORTUGUESE => "Bibliografia",
-            Lang::ROMANIAN => "Bibliografie",
-            Lang::RUSSIAN => "Библиография",
-            Lang::SERBIAN => "Литература",
-            Lang::SLOVENIAN => "Literatura",
-            Lang::SPANISH => "Bibliografía",
-            Lang::SWEDISH => "Bibliografi",
-            Lang::TURKISH => "Kaynakça",
-            Lang::UKRAINIAN => "Бібліографія",
-            Lang::VIETNAMESE => "Tài liệu tham khảo",
-            Lang::JAPANESE => "参考文献",
-            Lang::ENGLISH | _ => "Bibliography",
-        }
-    }
+    const KEY: &'static str = "bibliography";
 }
 
 /// A loaded bibliography.
@@ -394,7 +357,7 @@ impl Bibliography {
 
         Ok(Bibliography {
             map: Arc::new(map),
-            hash: crate::util::hash128(data),
+            hash: crate::utils::hash128(data),
         })
     }
 
@@ -545,7 +508,7 @@ impl Reflect for CslStyle {
 }
 
 impl FromValue for CslStyle {
-    fn from_value(value: Value) -> StrResult<Self> {
+    fn from_value(value: Value) -> HintedStrResult<Self> {
         if let Value::Dyn(dynamic) = &value {
             if let Some(concrete) = dynamic.downcast::<Self>() {
                 return Ok(concrete.clone());
@@ -779,7 +742,7 @@ impl<'a> Generator<'a> {
         let citations = self.display_citations(rendered);
         let references = self.display_references(rendered);
         let hanging_indent =
-            rendered.bibliography.as_ref().map_or(false, |b| b.hanging_indent);
+            rendered.bibliography.as_ref().is_some_and(|b| b.hanging_indent);
         Ok(Works { citations, references, hanging_indent })
     }
 
@@ -870,13 +833,16 @@ impl<'a> Generator<'a> {
                     let dest = Destination::Location(*location);
                     content = content.linked(dest);
                 }
-                content.backlinked(backlink)
+                content
             });
 
             // Render the main reference content.
-            let reference = renderer
-                .display_elem_children(&item.content, &mut prefix)
-                .backlinked(backlink);
+            let mut reference =
+                renderer.display_elem_children(&item.content, &mut prefix);
+
+            // Attach a backlink to either the prefix or the reference so that
+            // we can link to the bibliography entry.
+            prefix.as_mut().unwrap_or(&mut reference).set_location(backlink);
 
             output.push((prefix, reference));
         }
@@ -948,8 +914,12 @@ impl ElemRenderer<'_> {
         if let Some(prefix) = suf_prefix {
             const COLUMN_GUTTER: Em = Em::new(0.65);
             content = GridElem::new(vec![
-                GridChild::Cell(Packed::new(GridCell::new(prefix)).spanned(self.span)),
-                GridChild::Cell(Packed::new(GridCell::new(content)).spanned(self.span)),
+                GridChild::Item(GridItem::Cell(
+                    Packed::new(GridCell::new(prefix)).spanned(self.span),
+                )),
+                GridChild::Item(GridItem::Cell(
+                    Packed::new(GridCell::new(content)).spanned(self.span),
+                )),
             ])
             .with_columns(TrackSizings(smallvec![Sizing::Auto; 2]))
             .with_column_gutter(TrackSizings(smallvec![COLUMN_GUTTER.into()]))
@@ -959,8 +929,10 @@ impl ElemRenderer<'_> {
 
         match elem.display {
             Some(Display::Block) => {
-                content =
-                    BlockElem::new().with_body(Some(content)).pack().spanned(self.span);
+                content = BlockElem::new()
+                    .with_body(Some(BlockChild::Content(content)))
+                    .pack()
+                    .spanned(self.span);
             }
             Some(Display::Indent) => {
                 content = PadElem::new(content).pack().spanned(self.span);

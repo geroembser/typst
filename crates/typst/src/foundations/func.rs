@@ -1,18 +1,18 @@
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 
-use comemo::TrackedMut;
+use comemo::{Tracked, TrackedMut};
 use ecow::{eco_format, EcoString};
 use once_cell::sync::Lazy;
 
 use crate::diag::{bail, SourceResult, StrResult};
 use crate::engine::Engine;
 use crate::foundations::{
-    cast, repr, scope, ty, Args, CastInfo, Content, Element, IntoArgs, Scope, Selector,
-    Type, Value,
+    cast, repr, scope, ty, Args, CastInfo, Content, Context, Element, IntoArgs, Scope,
+    Selector, Type, Value,
 };
 use crate::syntax::{ast, Span, SyntaxNode};
-use crate::util::{LazyHash, Static};
+use crate::utils::{LazyHash, Static};
 
 #[doc(inline)]
 pub use typst_macros::func;
@@ -81,6 +81,10 @@ pub use typst_macros::func;
 /// body evaluates to the result of joining all expressions preceding the
 /// `return`.
 ///
+/// Functions that don't return any meaningful value return [`none`] instead.
+/// The return type of such functions is not explicitly specified in the
+/// documentation. (An example of this is [`array.push`]).
+///
 /// ```example
 /// #let alert(body, fill: red) = {
 ///   set text(white)
@@ -101,6 +105,12 @@ pub use typst_macros::func;
 ///   KEEP OFF TRACKS
 /// ]
 /// ```
+///
+/// # Importing functions
+/// Functions can be imported from one file ([`module`]($scripting/#modules)) into
+/// another using `{import}`. For example, assume that we have defined the `alert`
+/// function from the previous example in a file called `foo.typ`. We can import
+/// it into another file by writing `{import "foo.typ": alert}`.
 ///
 /// # Unnamed functions { #unnamed }
 /// You can also created an unnamed function without creating a binding by
@@ -181,6 +191,14 @@ impl Func {
         }
     }
 
+    /// Whether the function is known to be contextual.
+    pub fn contextual(&self) -> Option<bool> {
+        match &self.repr {
+            Repr::Native(native) => Some(native.contextual),
+            _ => None,
+        }
+    }
+
     /// Get details about this function's parameters if available.
     pub fn params(&self) -> Option<&'static [ParamInfo]> {
         match &self.repr {
@@ -249,17 +267,27 @@ impl Func {
         }
     }
 
-    /// Call the function with the given arguments.
-    pub fn call(&self, engine: &mut Engine, args: impl IntoArgs) -> SourceResult<Value> {
-        self.call_impl(engine, args.into_args(self.span))
+    /// Call the function with the given context and arguments.
+    pub fn call<A: IntoArgs>(
+        &self,
+        engine: &mut Engine,
+        context: Tracked<Context>,
+        args: A,
+    ) -> SourceResult<Value> {
+        self.call_impl(engine, context, args.into_args(self.span))
     }
 
     /// Non-generic implementation of `call`.
     #[typst_macros::time(name = "func call", span = self.span())]
-    fn call_impl(&self, engine: &mut Engine, mut args: Args) -> SourceResult<Value> {
+    fn call_impl(
+        &self,
+        engine: &mut Engine,
+        context: Tracked<Context>,
+        mut args: Args,
+    ) -> SourceResult<Value> {
         match &self.repr {
             Repr::Native(native) => {
-                let value = (native.function)(engine, &mut args)?;
+                let value = (native.function)(engine, context, &mut args)?;
                 args.finish()?;
                 Ok(value)
             }
@@ -273,14 +301,15 @@ impl Func {
                 closure,
                 engine.world,
                 engine.introspector,
+                engine.traced,
+                TrackedMut::reborrow_mut(&mut engine.sink),
                 engine.route.track(),
-                engine.locator.track(),
-                TrackedMut::reborrow_mut(&mut engine.tracer),
+                context,
                 args,
             ),
             Repr::With(with) => {
                 args.items = with.1.items.iter().cloned().chain(args.items).collect();
-                with.0.call(engine, args)
+                with.0.call(engine, context, args)
             }
         }
     }
@@ -322,6 +351,13 @@ impl Func {
 
     /// Returns a selector that filters for elements belonging to this function
     /// whose fields have the values of the given arguments.
+    ///
+    /// ```example
+    /// #show heading.where(level: 2): set text(blue)
+    /// = Section
+    /// == Subsection
+    /// === Sub-subection
+    /// ```
     #[func]
     pub fn where_(
         self,
@@ -414,13 +450,22 @@ pub trait NativeFunc {
 /// Defines a native function.
 #[derive(Debug)]
 pub struct NativeFuncData {
-    pub function: fn(&mut Engine, &mut Args) -> SourceResult<Value>,
+    /// Invokes the function from Typst.
+    pub function: fn(&mut Engine, Tracked<Context>, &mut Args) -> SourceResult<Value>,
+    /// The function's normal name (e.g. `align`), as exposed to Typst.
     pub name: &'static str,
+    /// The function's title case name (e.g. `Align`).
     pub title: &'static str,
+    /// The documentation for this function as a string.
     pub docs: &'static str,
+    /// A list of alternate search terms for this function.
     pub keywords: &'static [&'static str],
+    /// Whether this function makes use of context.
+    pub contextual: bool,
     pub scope: Lazy<Scope>,
+    /// A list of parameter information for each parameter.
     pub params: Lazy<Vec<ParamInfo>>,
+    /// Information about the return value of this function.
     pub returns: Lazy<CastInfo>,
 }
 
@@ -464,22 +509,22 @@ pub struct ParamInfo {
 /// A user-defined closure.
 #[derive(Debug, Hash)]
 pub struct Closure {
-    /// The closure's syntax node. Must be castable to `ast::Closure`.
+    /// The closure's syntax node. Must be either castable to `ast::Closure` or
+    /// `ast::Expr`. In the latter case, this is a synthesized closure without
+    /// any parameters (used by `context` expressions).
     pub node: SyntaxNode,
     /// Default values of named parameters.
     pub defaults: Vec<Value>,
     /// Captured values from outer scopes.
     pub captured: Scope,
+    /// The number of positional parameters in the closure.
+    pub num_pos_params: usize,
 }
 
 impl Closure {
     /// The name of the closure.
     pub fn name(&self) -> Option<&str> {
-        self.node
-            .cast::<ast::Closure>()
-            .unwrap()
-            .name()
-            .map(|ident| ident.as_str())
+        self.node.cast::<ast::Closure>()?.name().map(|ident| ident.as_str())
     }
 }
 

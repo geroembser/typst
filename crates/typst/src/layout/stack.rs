@@ -1,13 +1,17 @@
 use std::fmt::{self, Debug, Formatter};
+use typst_syntax::Span;
 
-use crate::diag::SourceResult;
+use crate::diag::{bail, SourceResult};
 use crate::engine::Engine;
-use crate::foundations::{cast, elem, Content, Packed, Resolve, StyleChain, StyledElem};
-use crate::layout::{
-    Abs, AlignElem, Axes, Axis, Dir, FixedAlignment, Fr, Fragment, Frame, HElem,
-    LayoutMultiple, Point, Regions, Size, Spacing, VElem,
+use crate::foundations::{
+    cast, elem, Content, NativeElement, Packed, Resolve, Show, StyleChain, StyledElem,
 };
-use crate::util::{Get, Numeric};
+use crate::introspection::{Locator, SplitLocator};
+use crate::layout::{
+    Abs, AlignElem, Axes, Axis, BlockElem, Dir, FixedAlignment, Fr, Fragment, Frame,
+    HElem, Point, Regions, Size, Spacing, VElem,
+};
+use crate::utils::{Get, Numeric};
 
 /// Arranges content and spacing horizontally or vertically.
 ///
@@ -23,7 +27,7 @@ use crate::util::{Get, Numeric};
 ///   rect(width: 90pt),
 /// )
 /// ```
-#[elem(LayoutMultiple)]
+#[elem(Show)]
 pub struct StackElem {
     /// The direction along which the items are stacked. Possible values are:
     ///
@@ -51,53 +55,11 @@ pub struct StackElem {
     pub children: Vec<StackChild>,
 }
 
-impl LayoutMultiple for Packed<StackElem> {
-    #[typst_macros::time(name = "stack", span = self.span())]
-    fn layout(
-        &self,
-        engine: &mut Engine,
-        styles: StyleChain,
-        regions: Regions,
-    ) -> SourceResult<Fragment> {
-        let mut layouter = StackLayouter::new(self.dir(styles), regions, styles);
-        let axis = layouter.dir.axis();
-
-        // Spacing to insert before the next block.
-        let spacing = self.spacing(styles);
-        let mut deferred = None;
-
-        for child in self.children() {
-            match child {
-                StackChild::Spacing(kind) => {
-                    layouter.layout_spacing(*kind);
-                    deferred = None;
-                }
-                StackChild::Block(block) => {
-                    // Transparently handle `h`.
-                    if let (Axis::X, Some(h)) = (axis, block.to_packed::<HElem>()) {
-                        layouter.layout_spacing(*h.amount());
-                        deferred = None;
-                        continue;
-                    }
-
-                    // Transparently handle `v`.
-                    if let (Axis::Y, Some(v)) = (axis, block.to_packed::<VElem>()) {
-                        layouter.layout_spacing(*v.amount());
-                        deferred = None;
-                        continue;
-                    }
-
-                    if let Some(kind) = deferred {
-                        layouter.layout_spacing(kind);
-                    }
-
-                    layouter.layout_block(engine, block, styles)?;
-                    deferred = spacing;
-                }
-            }
-        }
-
-        Ok(layouter.finish())
+impl Show for Packed<StackElem> {
+    fn show(&self, _: &mut Engine, _: StyleChain) -> SourceResult<Content> {
+        Ok(BlockElem::multi_layouter(self.clone(), layout_stack)
+            .pack()
+            .spanned(self.span()))
     }
 }
 
@@ -129,22 +91,78 @@ cast! {
     v: Content => Self::Block(v),
 }
 
+/// Layout the stack.
+#[typst_macros::time(span = elem.span())]
+fn layout_stack(
+    elem: &Packed<StackElem>,
+    engine: &mut Engine,
+    locator: Locator,
+    styles: StyleChain,
+    regions: Regions,
+) -> SourceResult<Fragment> {
+    let mut layouter =
+        StackLayouter::new(elem.span(), elem.dir(styles), locator, styles, regions);
+
+    let axis = layouter.dir.axis();
+
+    // Spacing to insert before the next block.
+    let spacing = elem.spacing(styles);
+    let mut deferred = None;
+
+    for child in elem.children() {
+        match child {
+            StackChild::Spacing(kind) => {
+                layouter.layout_spacing(*kind);
+                deferred = None;
+            }
+            StackChild::Block(block) => {
+                // Transparently handle `h`.
+                if let (Axis::X, Some(h)) = (axis, block.to_packed::<HElem>()) {
+                    layouter.layout_spacing(*h.amount());
+                    deferred = None;
+                    continue;
+                }
+
+                // Transparently handle `v`.
+                if let (Axis::Y, Some(v)) = (axis, block.to_packed::<VElem>()) {
+                    layouter.layout_spacing(*v.amount());
+                    deferred = None;
+                    continue;
+                }
+
+                if let Some(kind) = deferred {
+                    layouter.layout_spacing(kind);
+                }
+
+                layouter.layout_block(engine, block, styles)?;
+                deferred = spacing;
+            }
+        }
+    }
+
+    layouter.finish()
+}
+
 /// Performs stack layout.
 struct StackLayouter<'a> {
+    /// The span to raise errors at during layout.
+    span: Span,
     /// The stacking direction.
     dir: Dir,
     /// The axis of the stacking direction.
     axis: Axis,
-    /// The regions to layout children into.
-    regions: Regions<'a>,
+    /// Provides unique locations to the stack's children.
+    locator: SplitLocator<'a>,
     /// The inherited styles.
     styles: StyleChain<'a>,
+    /// The regions to layout children into.
+    regions: Regions<'a>,
     /// Whether the stack itself should expand to fill the region.
     expand: Axes<bool>,
     /// The initial size of the current region before we started subtracting.
     initial: Size,
     /// The generic size used by the frames for the current region.
-    used: Gen<Abs>,
+    used: GenericSize<Abs>,
     /// The sum of fractions in the current region.
     fr: Fr,
     /// Already layouted items whose exact positions are not yet known due to
@@ -166,7 +184,13 @@ enum StackItem {
 
 impl<'a> StackLayouter<'a> {
     /// Create a new stack layouter.
-    fn new(dir: Dir, mut regions: Regions<'a>, styles: StyleChain<'a>) -> Self {
+    fn new(
+        span: Span,
+        dir: Dir,
+        locator: Locator<'a>,
+        styles: StyleChain<'a>,
+        mut regions: Regions<'a>,
+    ) -> Self {
         let axis = dir.axis();
         let expand = regions.expand;
 
@@ -174,13 +198,15 @@ impl<'a> StackLayouter<'a> {
         regions.expand.set(axis, false);
 
         Self {
+            span,
             dir,
             axis,
-            regions,
+            locator: locator.split(),
             styles,
+            regions,
             expand,
             initial: regions.size,
-            used: Gen::zero(),
+            used: GenericSize::zero(),
             fr: Fr::zero(),
             items: vec![],
             finished: vec![],
@@ -218,10 +244,10 @@ impl<'a> StackLayouter<'a> {
         styles: StyleChain,
     ) -> SourceResult<()> {
         if self.regions.is_full() {
-            self.finish_region();
+            self.finish_region()?;
         }
 
-        // Block-axis alignment of the `AlignElement` is respected by stacks.
+        // Block-axis alignment of the `AlignElem` is respected by stacks.
         let align = if let Some(align) = block.to_packed::<AlignElem>() {
             align.alignment(styles)
         } else if let Some(styled) = block.to_packed::<StyledElem>() {
@@ -231,27 +257,33 @@ impl<'a> StackLayouter<'a> {
         }
         .resolve(styles);
 
-        let fragment = block.layout(engine, styles, self.regions)?;
+        let fragment = block.layout(
+            engine,
+            self.locator.next(&block.span()),
+            styles,
+            self.regions,
+        )?;
+
         let len = fragment.len();
         for (i, frame) in fragment.into_iter().enumerate() {
             // Grow our size, shrink the region and save the frame for later.
-            let size = frame.size();
+            let specific_size = frame.size();
             if self.dir.axis() == Axis::Y {
-                self.regions.size.y -= size.y;
+                self.regions.size.y -= specific_size.y;
             }
 
-            let gen = match self.axis {
-                Axis::X => Gen::new(size.y, size.x),
-                Axis::Y => Gen::new(size.x, size.y),
+            let generic_size = match self.axis {
+                Axis::X => GenericSize::new(specific_size.y, specific_size.x),
+                Axis::Y => GenericSize::new(specific_size.x, specific_size.y),
             };
 
-            self.used.main += gen.main;
-            self.used.cross.set_max(gen.cross);
+            self.used.main += generic_size.main;
+            self.used.cross.set_max(generic_size.cross);
 
             self.items.push(StackItem::Frame(frame, align));
 
             if i + 1 < len {
-                self.finish_region();
+                self.finish_region()?;
             }
         }
 
@@ -259,7 +291,7 @@ impl<'a> StackLayouter<'a> {
     }
 
     /// Advance to the next region.
-    fn finish_region(&mut self) {
+    fn finish_region(&mut self) -> SourceResult<()> {
         // Determine the size of the stack in this region depending on whether
         // the region expands.
         let mut size = self
@@ -273,6 +305,10 @@ impl<'a> StackLayouter<'a> {
         if self.fr.get() > 0.0 && full.is_finite() {
             self.used.main = full;
             size.set(self.axis, full);
+        }
+
+        if !size.is_finite() {
+            bail!(self.span, "stack spacing is infinite");
         }
 
         let mut output = Frame::hard(size);
@@ -307,7 +343,7 @@ impl<'a> StackLayouter<'a> {
                         .get(other)
                         .position(size.get(other) - frame.size().get(other));
 
-                    let pos = Gen::new(cross, main).to_point(self.axis);
+                    let pos = GenericSize::new(cross, main).to_point(self.axis);
                     cursor += child;
                     output.push_frame(pos, frame);
                 }
@@ -317,28 +353,31 @@ impl<'a> StackLayouter<'a> {
         // Advance to the next region.
         self.regions.next();
         self.initial = self.regions.size;
-        self.used = Gen::zero();
+        self.used = GenericSize::zero();
         self.fr = Fr::zero();
         self.finished.push(output);
+
+        Ok(())
     }
 
     /// Finish layouting and return the resulting frames.
-    fn finish(mut self) -> Fragment {
-        self.finish_region();
-        Fragment::frames(self.finished)
+    fn finish(mut self) -> SourceResult<Fragment> {
+        self.finish_region()?;
+        Ok(Fragment::frames(self.finished))
     }
 }
 
-/// A container with a main and cross component.
+/// A generic size with main and cross axes. The axes are generic, meaning the
+/// main axis could correspond to either the X or the Y axis.
 #[derive(Default, Copy, Clone, Eq, PartialEq, Hash)]
-struct Gen<T> {
-    /// The main component.
+struct GenericSize<T> {
+    /// The cross component, along the axis perpendicular to the main.
     pub cross: T,
-    /// The cross component.
+    /// The main component.
     pub main: T,
 }
 
-impl<T> Gen<T> {
+impl<T> GenericSize<T> {
     /// Create a new instance from the two components.
     const fn new(cross: T, main: T) -> Self {
         Self { cross, main }
@@ -353,7 +392,7 @@ impl<T> Gen<T> {
     }
 }
 
-impl Gen<Abs> {
+impl GenericSize<Abs> {
     /// The zero value.
     fn zero() -> Self {
         Self { cross: Abs::zero(), main: Abs::zero() }

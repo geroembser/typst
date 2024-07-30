@@ -4,6 +4,16 @@
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 #[repr(u8)]
 pub enum SyntaxKind {
+    /// The end of token stream.
+    End,
+    /// An invalid sequence of characters.
+    Error,
+
+    /// A line comment: `// ...`.
+    LineComment,
+    /// A block comment: `/* ... */`.
+    BlockComment,
+
     /// The contents of a file or content block.
     Markup,
     /// Plain text without markup.
@@ -28,6 +38,12 @@ pub enum SyntaxKind {
     Emph,
     /// Raw text with optional syntax highlighting: `` `...` ``.
     Raw,
+    /// A language tag at the start of raw text: ``typ ``.
+    RawLang,
+    /// A raw delimiter consisting of 1 or 3+ backticks: `` ` ``.
+    RawDelim,
+    /// A sequence of whitespace to ignore in a raw text: `    `.
+    RawTrimmed,
     /// A hyperlink: `https://typst.org`.
     Link,
     /// A label: `<intro>`.
@@ -159,6 +175,8 @@ pub enum SyntaxKind {
     Set,
     /// The `show` keyword.
     Show,
+    /// The `context` keyword.
+    Context,
     /// The `if` keyword.
     If,
     /// The `else` keyword.
@@ -232,6 +250,8 @@ pub enum SyntaxKind {
     SetRule,
     /// A show rule: `show heading: it => emph(it.body)`.
     ShowRule,
+    /// A contextual expression: `context text.lang`.
+    Contextual,
     /// An if-else conditional: `if x { y } else { z }`.
     Conditional,
     /// A while loop: `while x { y }`.
@@ -242,6 +262,8 @@ pub enum SyntaxKind {
     ModuleImport,
     /// Items to import from a module: `a, b, c`.
     ImportItems,
+    /// A path to an imported name from a submodule: `a.b.c`.
+    ImportItemPath,
     /// A renamed import item: `a as d`.
     RenamedImportItem,
     /// A module include: `include "chapter1.typ"`.
@@ -256,15 +278,6 @@ pub enum SyntaxKind {
     Destructuring,
     /// A destructuring assignment expression: `(x, y) = (1, 2)`.
     DestructAssignment,
-
-    /// A line comment: `// ...`.
-    LineComment,
-    /// A block comment: `/* ... */`.
-    BlockComment,
-    /// An invalid sequence of characters.
-    Error,
-    /// The end of the file.
-    Eof,
 }
 
 impl SyntaxKind {
@@ -285,7 +298,7 @@ impl SyntaxKind {
     pub fn is_terminator(self) -> bool {
         matches!(
             self,
-            Self::Eof
+            Self::End
                 | Self::Semicolon
                 | Self::RightBrace
                 | Self::RightParen
@@ -322,6 +335,7 @@ impl SyntaxKind {
                 | Self::Let
                 | Self::Set
                 | Self::Show
+                | Self::Context
                 | Self::If
                 | Self::Else
                 | Self::For
@@ -341,7 +355,7 @@ impl SyntaxKind {
     pub fn is_trivia(self) -> bool {
         matches!(
             self,
-            Self::Space | Self::Parbreak | Self::LineComment | Self::BlockComment
+            Self::LineComment | Self::BlockComment | Self::Space | Self::Parbreak
         )
     }
 
@@ -353,6 +367,10 @@ impl SyntaxKind {
     /// A human-readable name for the kind.
     pub fn name(self) -> &'static str {
         match self {
+            Self::End => "end of tokens",
+            Self::Error => "syntax error",
+            Self::LineComment => "line comment",
+            Self::BlockComment => "block comment",
             Self::Markup => "markup",
             Self::Text => "text",
             Self::Space => "space",
@@ -364,6 +382,9 @@ impl SyntaxKind {
             Self::Strong => "strong content",
             Self::Emph => "emphasized content",
             Self::Raw => "raw block",
+            Self::RawLang => "raw language tag",
+            Self::RawTrimmed => "raw trimmed",
+            Self::RawDelim => "raw delimiter",
             Self::Link => "link",
             Self::Label => "label",
             Self::Ref => "reference",
@@ -426,6 +447,7 @@ impl SyntaxKind {
             Self::Let => "keyword `let`",
             Self::Set => "keyword `set`",
             Self::Show => "keyword `show`",
+            Self::Context => "keyword `context`",
             Self::If => "keyword `if`",
             Self::Else => "keyword `else`",
             Self::For => "keyword `for`",
@@ -462,11 +484,13 @@ impl SyntaxKind {
             Self::LetBinding => "`let` expression",
             Self::SetRule => "`set` expression",
             Self::ShowRule => "`show` expression",
+            Self::Contextual => "`context` expression",
             Self::Conditional => "`if` expression",
             Self::WhileLoop => "while-loop expression",
             Self::ForLoop => "for-loop expression",
             Self::ModuleImport => "`import` expression",
             Self::ImportItems => "import items",
+            Self::ImportItemPath => "imported item path",
             Self::RenamedImportItem => "renamed import item",
             Self::ModuleInclude => "`include` expression",
             Self::LoopBreak => "`break` expression",
@@ -474,10 +498,6 @@ impl SyntaxKind {
             Self::FuncReturn => "`return` expression",
             Self::Destructuring => "destructuring pattern",
             Self::DestructAssignment => "destructuring assignment expression",
-            Self::LineComment => "line comment",
-            Self::BlockComment => "block comment",
-            Self::Error => "syntax error",
-            Self::Eof => "end of file",
         }
     }
 }

@@ -1,5 +1,9 @@
+use comemo::Track;
+
 use crate::diag::{At, SourceResult};
-use crate::foundations::{cast, elem, Content, Func, Packed, Resolve, Smart, StyleChain};
+use crate::foundations::{
+    cast, elem, Content, Context, Func, Packed, Resolve, Smart, StyleChain,
+};
 use crate::layout::{
     Abs, Angle, Frame, FrameItem, Length, Point, Ratio, Rel, Size, Transform,
 };
@@ -61,13 +65,13 @@ pub struct CancelElem {
 
     /// How much to rotate the cancel line.
     ///
+    /// - If given an angle, the line is rotated by that angle clockwise with
+    ///   respect to the y-axis.
     /// - If `{auto}`, the line assumes the default angle; that is, along the
-    ///   diagonal line of the content box.
-    /// - If given an angle, the line is rotated by that angle clockwise w.r.t
-    ///   the y-axis.
-    /// - If given a function `angle => angle`, the line is rotated by the angle
-    ///   returned by that function. The function receives the default angle as
-    ///   its input.
+    ///   rising diagonal of the content box.
+    /// - If given a function `angle => angle`, the line is rotated, with
+    ///   respect to the y-axis, by the angle returned by that function. The
+    ///   function receives the default angle as its input.
     ///
     /// ```example
     /// >>> #set page(width: 140pt)
@@ -135,6 +139,7 @@ impl LayoutMath for Packed<CancelElem> {
             invert_first_line,
             &angle,
             body_size,
+            styles,
             span,
         )?;
 
@@ -144,8 +149,9 @@ impl LayoutMath for Packed<CancelElem> {
 
         if cross {
             // Draw the second line.
-            let second_line =
-                draw_cancel_line(ctx, length, stroke, true, &angle, body_size, span)?;
+            let second_line = draw_cancel_line(
+                ctx, length, stroke, true, &angle, body_size, styles, span,
+            )?;
 
             body.push_frame(center, second_line);
         }
@@ -180,6 +186,7 @@ cast! {
 }
 
 /// Draws a cancel line.
+#[allow(clippy::too_many_arguments)]
 fn draw_cancel_line(
     ctx: &mut MathContext,
     length_scale: Rel<Abs>,
@@ -187,6 +194,7 @@ fn draw_cancel_line(
     invert: bool,
     angle: &Smart<CancelAngle>,
     body_size: Size,
+    styles: StyleChain,
     span: Span,
 ) -> SourceResult<Frame> {
     let default = default_angle(body_size);
@@ -197,9 +205,10 @@ fn draw_cancel_line(
             // This specifies the absolute angle w.r.t y-axis clockwise.
             CancelAngle::Angle(v) => *v,
             // This specifies a function that takes the default angle as input.
-            CancelAngle::Func(func) => {
-                func.call(ctx.engine, [default])?.cast().at(span)?
-            }
+            CancelAngle::Func(func) => func
+                .call(ctx.engine, Context::new(None, Some(styles)).track(), [default])?
+                .cast()
+                .at(span)?,
         },
     };
 

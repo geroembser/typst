@@ -6,13 +6,15 @@ use ttf_parser::{GlyphId, Rect};
 use unicode_math_class::MathClass;
 
 use crate::foundations::StyleChain;
-use crate::introspection::{Meta, MetaElem};
-use crate::layout::{Abs, Corner, Em, Frame, FrameItem, Point, Size};
-use crate::math::{
-    scaled_font_size, styled_char, EquationElem, Limits, MathContext, MathSize, Scaled,
+use crate::layout::{
+    Abs, Corner, Em, Frame, FrameItem, HideElem, Point, Size, VAlignment,
 };
+use crate::math::{
+    scaled_font_size, EquationElem, Limits, MathContext, MathSize, Scaled,
+};
+use crate::model::{Destination, LinkElem};
 use crate::syntax::Span;
-use crate::text::{Font, Glyph, Lang, TextElem, TextItem};
+use crate::text::{Font, Glyph, Lang, Region, TextElem, TextItem};
 use crate::visualize::Paint;
 
 #[derive(Debug, Clone)]
@@ -69,6 +71,13 @@ impl MathFragment {
         }
     }
 
+    pub fn is_ignorant(&self) -> bool {
+        match self {
+            Self::Frame(fragment) => fragment.ignorant,
+            _ => false,
+        }
+    }
+
     pub fn class(&self) -> MathClass {
         match self {
             Self::Glyph(glyph) => glyph.class,
@@ -118,17 +127,18 @@ impl MathFragment {
     }
 
     pub fn is_spaced(&self) -> bool {
-        self.class() == MathClass::Fence
-            || match self {
-                MathFragment::Frame(frame) => {
-                    frame.spaced
-                        && matches!(
-                            frame.class,
-                            MathClass::Normal | MathClass::Alphabetic
-                        )
-                }
-                _ => false,
-            }
+        if self.class() == MathClass::Fence {
+            return true;
+        }
+
+        matches!(
+            self,
+            MathFragment::Frame(FrameFragment {
+                spaced: true,
+                class: MathClass::Normal | MathClass::Alphabetic,
+                ..
+            })
+        )
     }
 
     pub fn is_text_like(&self) -> bool {
@@ -206,6 +216,7 @@ pub struct GlyphFragment {
     pub c: char,
     pub font: Font,
     pub lang: Lang,
+    pub region: Option<Region>,
     pub fill: Paint,
     pub shift: Abs,
     pub width: Abs,
@@ -217,7 +228,8 @@ pub struct GlyphFragment {
     pub class: MathClass,
     pub math_size: MathSize,
     pub span: Span,
-    pub meta: SmallVec<[Meta; 1]>,
+    pub dests: SmallVec<[Destination; 1]>,
+    pub hidden: bool,
     pub limits: Limits,
 }
 
@@ -234,7 +246,6 @@ impl GlyphFragment {
         c: char,
         span: Span,
     ) -> Option<Self> {
-        let c = styled_char(styles, c);
         let id = ctx.ttf.glyph_index(c)?;
         let id = Self::adjust_glyph_index(ctx, id);
         Some(Self::with_id(ctx, styles, c, id, span))
@@ -260,6 +271,7 @@ impl GlyphFragment {
             c,
             font: ctx.font.clone(),
             lang: TextElem::lang_in(styles),
+            region: TextElem::region_in(styles),
             fill: TextElem::fill_in(styles).as_decoration(),
             shift: TextElem::baseline_in(styles),
             font_size: scaled_font_size(ctx, styles),
@@ -272,7 +284,8 @@ impl GlyphFragment {
             accent_attach: Abs::zero(),
             class,
             span,
-            meta: MetaElem::data_in(styles),
+            dests: LinkElem::dests_in(styles),
+            hidden: HideElem::hidden_in(styles),
         };
         fragment.set_id(ctx, id);
         fragment
@@ -341,6 +354,7 @@ impl GlyphFragment {
             size: self.font_size,
             fill: self.fill,
             lang: self.lang,
+            region: self.region,
             text: self.c.into(),
             stroke: None,
             glyphs: vec![Glyph {
@@ -355,7 +369,7 @@ impl GlyphFragment {
         let mut frame = Frame::soft(size);
         frame.set_baseline(self.ascent);
         frame.push(Point::with_y(self.ascent + self.shift), FrameItem::Text(item));
-        frame.meta_iter(self.meta);
+        frame.post_process_raw(self.dests, self.hidden);
         frame
     }
 
@@ -404,9 +418,15 @@ impl VariantFragment {
     /// Vertically adjust the fragment's frame so that it is centered
     /// on the axis.
     pub fn center_on_axis(&mut self, ctx: &MathContext) {
+        self.align_on_axis(ctx, VAlignment::Horizon)
+    }
+
+    /// Vertically adjust the fragment's frame so that it is aligned
+    /// to the given alignment on the axis.
+    pub fn align_on_axis(&mut self, ctx: &MathContext, align: VAlignment) {
         let h = self.frame.height();
         let axis = ctx.constants.axis_height().scaled(ctx, self.font_size);
-        self.frame.set_baseline(h / 2.0 + axis);
+        self.frame.set_baseline(align.inv().position(h + axis * 2.0));
     }
 }
 
@@ -428,13 +448,14 @@ pub struct FrameFragment {
     pub italics_correction: Abs,
     pub accent_attach: Abs,
     pub text_like: bool,
+    pub ignorant: bool,
 }
 
 impl FrameFragment {
     pub fn new(ctx: &MathContext, styles: StyleChain, mut frame: Frame) -> Self {
         let base_ascent = frame.ascent();
         let accent_attach = frame.width() / 2.0;
-        frame.meta(styles, false);
+        frame.post_process(styles);
         Self {
             frame,
             font_size: scaled_font_size(ctx, styles),
@@ -446,6 +467,7 @@ impl FrameFragment {
             italics_correction: Abs::zero(),
             accent_attach,
             text_like: false,
+            ignorant: false,
         }
     }
 
@@ -475,6 +497,10 @@ impl FrameFragment {
 
     pub fn with_text_like(self, text_like: bool) -> Self {
         Self { text_like, ..self }
+    }
+
+    pub fn with_ignorant(self, ignorant: bool) -> Self {
+        Self { ignorant, ..self }
     }
 }
 

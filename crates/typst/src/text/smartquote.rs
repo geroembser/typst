@@ -1,8 +1,10 @@
 use ecow::EcoString;
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::diag::{bail, StrResult};
-use crate::foundations::{array, cast, dict, elem, Array, Dict, FromValue, Smart, Str};
+use crate::diag::{bail, HintedStrResult, StrResult};
+use crate::foundations::{
+    array, cast, dict, elem, Array, Dict, FromValue, Packed, PlainText, Smart, Str,
+};
 use crate::layout::Dir;
 use crate::syntax::is_newline;
 use crate::text::{Lang, Region};
@@ -26,7 +28,7 @@ use crate::text::{Lang, Region};
 /// # Syntax
 /// This function also has dedicated syntax: The normal quote characters
 /// (`'` and `"`). Typst automatically makes your quotes smart.
-#[elem(name = "smartquote")]
+#[elem(name = "smartquote", PlainText)]
 pub struct SmartQuoteElem {
     /// Whether this should be a double quote.
     #[default(true)]
@@ -67,10 +69,9 @@ pub struct SmartQuoteElem {
     ///   - [string]($str): a string consisting of two characters containing the
     ///     opening and closing double quotes (characters here refer to Unicode
     ///     grapheme clusters)
-    ///   - [array]($array): an array containing the opening and closing double
-    ///     quotes
-    ///   - [dictionary]($dictionary): an array containing the double and single
-    ///     quotes, each specified as either `{auto}`, string, or array
+    ///   - [array]: an array containing the opening and closing double quotes
+    ///   - [dictionary]: an array containing the double and single quotes, each
+    ///     specified as either `{auto}`, string, or array
     ///
     /// ```example
     /// #set text(lang: "de")
@@ -84,6 +85,16 @@ pub struct SmartQuoteElem {
     /// ```
     #[borrowed]
     pub quotes: Smart<SmartQuoteDict>,
+}
+
+impl PlainText for Packed<SmartQuoteElem> {
+    fn plain_text(&self, text: &mut EcoString) {
+        if self.double.unwrap_or(true) {
+            text.push_str("\"");
+        } else {
+            text.push_str("'");
+        }
+    }
 }
 
 /// State machine for smart quote substitution.
@@ -112,7 +123,7 @@ impl SmartQuoter {
 
     /// Process the last seen character.
     pub fn last(&mut self, c: char, is_quote: bool) {
-        self.expect_opening = is_ignorable(c) || is_opening_bracket(c);
+        self.expect_opening = is_exterior_to_quote(c) || is_opening_bracket(c);
         self.last_num = c.is_numeric();
         if !is_quote {
             self.prev_quote_type = None;
@@ -139,7 +150,7 @@ impl SmartQuoter {
             self.prev_quote_type = Some(double);
             quotes.open(double)
         } else if self.quote_depth > 0
-            && (peeked.is_ascii_punctuation() || is_ignorable(peeked))
+            && (peeked.is_ascii_punctuation() || is_exterior_to_quote(peeked))
         {
             self.quote_depth -= 1;
             quotes.close(double)
@@ -157,7 +168,7 @@ impl Default for SmartQuoter {
     }
 }
 
-fn is_ignorable(c: char) -> bool {
+fn is_exterior_to_quote(c: char) -> bool {
     c.is_whitespace() || is_newline(c)
 }
 
@@ -321,7 +332,7 @@ fn str_to_set(value: &str) -> StrResult<[EcoString; 2]> {
     }
 }
 
-fn array_to_set(value: Array) -> StrResult<[EcoString; 2]> {
+fn array_to_set(value: Array) -> HintedStrResult<[EcoString; 2]> {
     let value = value.as_slice();
     if value.len() != 2 {
         bail!(

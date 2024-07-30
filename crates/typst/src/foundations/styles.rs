@@ -3,25 +3,24 @@ use std::fmt::{self, Debug, Formatter};
 use std::hash::{Hash, Hasher};
 use std::{mem, ptr};
 
+use comemo::{Track, Tracked};
 use ecow::{eco_vec, EcoString, EcoVec};
 use smallvec::SmallVec;
 
-use crate::diag::{SourceResult, Trace, Tracepoint};
+use crate::diag::{warning, SourceResult, Trace, Tracepoint};
 use crate::engine::Engine;
 use crate::foundations::{
-    cast, elem, func, ty, Content, Element, Func, NativeElement, Packed, Repr, Selector,
-    Show,
+    cast, elem, func, ty, Content, Context, Element, Func, NativeElement, Packed, Repr,
+    Selector, Show,
 };
+use crate::introspection::Locatable;
 use crate::syntax::Span;
 use crate::text::{FontFamily, FontList, TextElem};
-use crate::util::LazyHash;
+use crate::utils::LazyHash;
 
 /// Provides access to active styles.
 ///
-/// The styles are currently opaque and only useful in combination with the
-/// [`measure`]($measure) function. See its documentation for more details. In
-/// the future, the provided styles might also be directly accessed to look up
-/// styles defined by [set rules]($styling/#set-rules).
+/// **Deprecation planned.** Use [context] instead.
 ///
 /// ```example
 /// #let thing(body) = style(styles => {
@@ -34,6 +33,8 @@ use crate::util::LazyHash;
 /// ```
 #[func]
 pub fn style(
+    /// The engine.
+    engine: &mut Engine,
     /// The call site span.
     span: Span,
     /// A function to call with the styles. Its return value is displayed
@@ -44,11 +45,16 @@ pub fn style(
     /// content that depends on the style context it appears in.
     func: Func,
 ) -> Content {
+    engine.sink.warn(warning!(
+        span, "`style` is deprecated";
+        hint: "use a `context` expression instead"
+    ));
+
     StyleElem::new(func).pack().spanned(span)
 }
 
 /// Executes a style access.
-#[elem(Show)]
+#[elem(Locatable, Show)]
 struct StyleElem {
     /// The function to call with the styles.
     #[required]
@@ -58,7 +64,11 @@ struct StyleElem {
 impl Show for Packed<StyleElem> {
     #[typst_macros::time(name = "style", span = self.span())]
     fn show(&self, engine: &mut Engine, styles: StyleChain) -> SourceResult<Content> {
-        Ok(self.func().call(engine, [styles.to_map()])?.display())
+        let context = Context::new(self.location(), Some(styles));
+        Ok(self
+            .func()
+            .call(engine, context.track(), [styles.to_map()])?
+            .display())
     }
 }
 
@@ -69,8 +79,8 @@ pub struct Styles(EcoVec<LazyHash<Style>>);
 
 impl Styles {
     /// Create a new, empty style list.
-    pub fn new() -> Self {
-        Self::default()
+    pub const fn new() -> Self {
+        Self(EcoVec::new())
     }
 
     /// Whether this contains no styles.
@@ -318,9 +328,6 @@ trait Blockable: Debug + Send + Sync + 'static {
     /// Equivalent to `downcast_ref` for the block.
     fn as_any(&self) -> &dyn Any;
 
-    /// Equivalent to `downcast_mut` for the block.
-    fn as_any_mut(&mut self) -> &mut dyn Any;
-
     /// Equivalent to [`Hash`] for the block.
     fn dyn_hash(&self, state: &mut dyn Hasher);
 
@@ -330,10 +337,6 @@ trait Blockable: Debug + Send + Sync + 'static {
 
 impl<T: Debug + Clone + Hash + Send + Sync + 'static> Blockable for T {
     fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
 
@@ -358,9 +361,13 @@ impl Hash for dyn Blockable {
 /// A show rule recipe.
 #[derive(Clone, PartialEq, Hash)]
 pub struct Recipe {
-    /// The span errors are reported with.
+    /// The span that errors are reported with.
     pub span: Span,
     /// Determines whether the recipe applies to an element.
+    ///
+    /// If this is `None`, then this recipe is from a show rule with
+    /// no selector (`show: rest => ...`), which is [eagerly applied][Content::styled_with_recipe]
+    /// to the rest of the content in the scope.
     pub selector: Option<Selector>,
     /// The transformation to perform on the match.
     pub transform: Transformation,
@@ -379,15 +386,20 @@ impl Recipe {
     pub fn applicable(&self, target: &Content, styles: StyleChain) -> bool {
         self.selector
             .as_ref()
-            .map_or(false, |selector| selector.matches(target, Some(styles)))
+            .is_some_and(|selector| selector.matches(target, Some(styles)))
     }
 
     /// Apply the recipe to the given content.
-    pub fn apply(&self, engine: &mut Engine, content: Content) -> SourceResult<Content> {
+    pub fn apply(
+        &self,
+        engine: &mut Engine,
+        context: Tracked<Context>,
+        content: Content,
+    ) -> SourceResult<Content> {
         let mut content = match &self.transform {
             Transformation::Content(content) => content.clone(),
             Transformation::Func(func) => {
-                let mut result = func.call(engine, [content.clone()]);
+                let mut result = func.call(engine, context, [content.clone()]);
                 if self.selector.is_some() {
                     let point = || Tracepoint::Show(content.func().name().into());
                     result = result.trace(engine.world, point, content.span());
@@ -731,16 +743,16 @@ impl<T: Fold> Fold for Option<T> {
 }
 
 impl<T> Fold for Vec<T> {
-    fn fold(mut self, outer: Self) -> Self {
-        self.extend(outer);
-        self
+    fn fold(self, mut outer: Self) -> Self {
+        outer.extend(self);
+        outer
     }
 }
 
 impl<T, const N: usize> Fold for SmallVec<[T; N]> {
-    fn fold(mut self, outer: Self) -> Self {
-        self.extend(outer);
-        self
+    fn fold(self, mut outer: Self) -> Self {
+        outer.extend(self);
+        outer
     }
 }
 

@@ -31,22 +31,22 @@ pub use self::space::*;
 use std::fmt::{self, Debug, Formatter};
 
 use ecow::{eco_format, EcoString};
-use rustybuzz::{Feature, Tag};
+use rustybuzz::Feature;
 use smallvec::SmallVec;
-use ttf_parser::Rect;
+use ttf_parser::{Rect, Tag};
 
-use crate::diag::{bail, SourceResult, StrResult};
+use crate::diag::{bail, warning, HintedStrResult, SourceResult};
 use crate::engine::Engine;
-use crate::foundations::Packed;
 use crate::foundations::{
-    cast, category, elem, Args, Array, Cast, Category, Construct, Content, Dict, Fold,
-    NativeElement, Never, PlainText, Repr, Resolve, Scope, Set, Smart, StyleChain,
+    cast, category, dict, elem, Args, Array, Cast, Category, Construct, Content, Dict,
+    Fold, NativeElement, Never, Packed, PlainText, Repr, Resolve, Scope, Set, Smart,
+    StyleChain,
 };
-use crate::layout::Em;
-use crate::layout::{Abs, Axis, Dir, Length, Rel};
+use crate::layout::{Abs, Axis, Dir, Em, Length, Ratio, Rel};
 use crate::model::ParElem;
 use crate::syntax::Spanned;
 use crate::visualize::{Color, Paint, RelativeTo, Stroke};
+use crate::World;
 
 /// Text styling.
 ///
@@ -66,10 +66,10 @@ pub(super) fn define(global: &mut Scope) {
     global.define_elem::<OverlineElem>();
     global.define_elem::<StrikeElem>();
     global.define_elem::<HighlightElem>();
+    global.define_elem::<SmallcapsElem>();
     global.define_elem::<RawElem>();
     global.define_func::<lower>();
     global.define_func::<upper>();
-    global.define_func::<smallcaps>();
     global.define_func::<lorem>();
 }
 
@@ -102,11 +102,17 @@ pub struct TextElem {
     /// - In the web app, you can see the list of available fonts by clicking on
     ///   the "Ag" button. You can provide additional fonts by uploading `.ttf`
     ///   or `.otf` files into your project. They will be discovered
-    ///   automatically.
+    ///   automatically. The priority is: project fonts > server fonts.
     ///
-    /// - Locally, Typst uses your installed system fonts. In addition, you can
-    ///   use the `--font-path` argument or `TYPST_FONT_PATHS` environment
-    ///   variable to add directories that should be scanned for fonts.
+    /// - Locally, Typst uses your installed system fonts or embedded fonts in
+    ///   the CLI, which are `Linux Libertine`, `New Computer Modern`,
+    ///   `New Computer Modern Math`, and `DejaVu Sans Mono`. In addition, you
+    ///   can use the `--font-path` argument or `TYPST_FONT_PATHS` environment
+    ///   variable to add directories that should be scanned for fonts. The
+    ///   priority is: `--font-paths` > system fonts > embedded fonts. Run
+    ///   `typst fonts` to see the fonts that Typst has discovered on your
+    ///   system. Note that you can pass the `--ignore-system-fonts` parameter
+    ///   to the CLI to ensure Typst won't search for system fonts.
     ///
     /// ```example
     /// #set text(font: "PT Sans")
@@ -120,6 +126,22 @@ pub struct TextElem {
     /// This is Latin. \
     /// هذا عربي.
     /// ```
+    #[parse({
+        let font_list: Option<Spanned<FontList>> = args.named("font")?;
+        if let Some(font_list) = &font_list {
+            let book = engine.world.book();
+            for family in &font_list.v {
+                if !book.contains_family(family.as_str()) {
+                    engine.sink.warn(warning!(
+                        font_list.span,
+                        "unknown font family: {}",
+                        family.as_str(),
+                    ));
+                }
+            }
+        }
+        font_list.map(|font_list| font_list.v)
+    })]
     #[default(FontList(vec![FontFamily::new("Linux Libertine")]))]
     #[borrowed]
     #[ghost]
@@ -155,9 +177,9 @@ pub struct TextElem {
     /// available either in an italic or oblique style, the difference between
     /// italic and oblique style is rarely observable.
     ///
-    /// If you want to emphasize your text, you should do so using the
-    /// [emph]($emph) function instead. This makes it easy to adapt the style
-    /// later if you change your mind about how to signify the emphasis.
+    /// If you want to emphasize your text, you should do so using the [emph]
+    /// function instead. This makes it easy to adapt the style later if you
+    /// change your mind about how to signify the emphasis.
     ///
     /// ```example
     /// #text(font: "Linux Libertine", style: "italic")[Italic]
@@ -172,9 +194,8 @@ pub struct TextElem {
     /// that is closest in weight.
     ///
     /// If you want to strongly emphasize your text, you should do so using the
-    /// [strong]($strong) function instead. This makes it easy to adapt the
-    /// style later if you change your mind about how to signify the strong
-    /// emphasis.
+    /// [strong] function instead. This makes it easy to adapt the style later
+    /// if you change your mind about how to signify the strong emphasis.
     ///
     /// ```example
     /// #set text(font: "IBM Plex Sans")
@@ -464,6 +485,47 @@ pub struct TextElem {
     #[ghost]
     pub hyphenate: Hyphenate,
 
+    /// The "cost" of various choices when laying out text. A higher cost means
+    /// the layout engine will make the choice less often. Costs are specified
+    /// as a ratio of the default cost, so `50%` will make text layout twice as
+    /// eager to make a given choice, while `200%` will make it half as eager.
+    ///
+    /// Currently, the following costs can be customized:
+    /// - `hyphenation`: splitting a word across multiple lines
+    /// - `runt`: ending a paragraph with a line with a single word
+    /// - `widow`: leaving a single line of paragraph on the next page
+    /// - `orphan`: leaving single line of paragraph on the previous page
+    ///
+    /// Hyphenation is generally avoided by placing the whole word on the next
+    /// line, so a higher hyphenation cost can result in awkward justification
+    /// spacing.
+    ///
+    /// Runts are avoided by placing more or fewer words on previous lines, so a
+    /// higher runt cost can result in more awkward in justification spacing.
+    ///
+    /// Text layout prevents widows and orphans by default because they are
+    /// generally discouraged by style guides. However, in some contexts they
+    /// are allowed because the prevention method, which moves a line to the
+    /// next page, can result in an uneven number of lines between pages.
+    /// The `widow` and `orphan` costs allow disabling these modifications.
+    /// (Currently, 0% allows widows/orphans; anything else, including the
+    /// default of `auto`, prevents them. More nuanced cost specification for
+    /// these modifications is planned for the future.)
+    ///
+    /// ```example
+    /// #set text(hyphenate: true, size: 11.4pt)
+    /// #set par(justify: true)
+    ///
+    /// #lorem(10)
+    ///
+    /// // Set hyphenation to ten times the normal cost.
+    /// #set text(costs: (hyphenation: 1000%))
+    ///
+    /// #lorem(10)
+    /// ```
+    #[fold]
+    pub costs: Costs,
+
     /// Whether to apply kerning.
     ///
     /// When enabled, specific letter pairings move closer together or further
@@ -622,6 +684,12 @@ pub struct TextElem {
     #[required]
     pub text: EcoString,
 
+    /// The offset of the text in the text syntax node referenced by this
+    /// element's span.
+    #[internal]
+    #[ghost]
+    pub span_offset: usize,
+
     /// A delta to apply on the font weight.
     #[internal]
     #[fold]
@@ -738,7 +806,7 @@ cast! {
         self.0.into_value()
     },
     family: FontFamily => Self(vec![family]),
-    values: Array => Self(values.into_iter().map(|v| v.cast()).collect::<StrResult<_>>()?),
+    values: Array => Self(values.into_iter().map(|v| v.cast()).collect::<HintedStrResult<_>>()?),
 }
 
 /// Resolve a prioritized iterator over the font families.
@@ -952,7 +1020,7 @@ cast! {
     TextDir,
     self => self.0.into_value(),
     v: Smart<Dir> => {
-        if v.map_or(false, |dir| dir.axis() == Axis::Y) {
+        if v.is_custom_and(|dir| dir.axis() == Axis::Y) {
             bail!("text direction must be horizontal");
         }
         Self(v)
@@ -1057,7 +1125,7 @@ cast! {
             let tag = v.cast::<EcoString>()?;
             Ok((Tag::from_bytes_lossy(tag.as_bytes()), 1))
         })
-        .collect::<StrResult<_>>()?),
+        .collect::<HintedStrResult<_>>()?),
     values: Dict => Self(values
         .into_iter()
         .map(|(k, v)| {
@@ -1065,7 +1133,7 @@ cast! {
             let tag = Tag::from_bytes_lossy(k.as_bytes());
             Ok((tag, num))
         })
-        .collect::<StrResult<_>>()?),
+        .collect::<HintedStrResult<_>>()?),
 }
 
 impl Fold for FontFeatures {
@@ -1159,4 +1227,80 @@ impl Fold for WeightDelta {
     fn fold(self, outer: Self) -> Self {
         Self(outer.0 + self.0)
     }
+}
+
+/// Costs for various layout decisions.
+///
+/// Costs are updated (prioritizing the later value) when folded.
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub struct Costs {
+    hyphenation: Option<Ratio>,
+    runt: Option<Ratio>,
+    widow: Option<Ratio>,
+    orphan: Option<Ratio>,
+}
+
+impl Costs {
+    #[must_use]
+    pub fn hyphenation(&self) -> Ratio {
+        self.hyphenation.unwrap_or(Ratio::one())
+    }
+
+    #[must_use]
+    pub fn runt(&self) -> Ratio {
+        self.runt.unwrap_or(Ratio::one())
+    }
+
+    #[must_use]
+    pub fn widow(&self) -> Ratio {
+        self.widow.unwrap_or(Ratio::one())
+    }
+
+    #[must_use]
+    pub fn orphan(&self) -> Ratio {
+        self.orphan.unwrap_or(Ratio::one())
+    }
+}
+
+impl Fold for Costs {
+    #[inline]
+    fn fold(self, outer: Self) -> Self {
+        Self {
+            hyphenation: self.hyphenation.or(outer.hyphenation),
+            runt: self.runt.or(outer.runt),
+            widow: self.widow.or(outer.widow),
+            orphan: self.orphan.or(outer.orphan),
+        }
+    }
+}
+
+cast! {
+    Costs,
+    self => dict![
+        "hyphenation" => self.hyphenation(),
+        "runt" => self.runt(),
+        "widow" => self.widow(),
+        "orphan" => self.orphan(),
+    ].into_value(),
+    mut v: Dict => {
+        let ret = Self {
+            hyphenation: v.take("hyphenation").ok().map(|v| v.cast()).transpose()?,
+            runt: v.take("runt").ok().map(|v| v.cast()).transpose()?,
+            widow: v.take("widow").ok().map(|v| v.cast()).transpose()?,
+            orphan: v.take("orphan").ok().map(|v| v.cast()).transpose()?,
+        };
+        v.finish(&["hyphenation", "runt", "widow", "orphan"])?;
+        ret
+    },
+}
+
+/// Pushes `text` wrapped in LRE/RLE + PDF to `out`.
+pub(crate) fn isolate(text: Content, styles: StyleChain, out: &mut Vec<Content>) {
+    out.push(TextElem::packed(match TextElem::dir_in(styles) {
+        Dir::RTL => "\u{202B}",
+        _ => "\u{202A}",
+    }));
+    out.push(text);
+    out.push(TextElem::packed("\u{202C}"));
 }

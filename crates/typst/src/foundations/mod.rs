@@ -11,6 +11,7 @@ mod bool;
 mod bytes;
 mod cast;
 mod content;
+mod context;
 mod datetime;
 mod dict;
 mod duration;
@@ -38,6 +39,7 @@ pub use self::auto::*;
 pub use self::bytes::*;
 pub use self::cast::*;
 pub use self::content::*;
+pub use self::context::*;
 pub use self::datetime::*;
 pub use self::dict::*;
 pub use self::duration::*;
@@ -47,7 +49,7 @@ pub use self::float::*;
 pub use self::func::*;
 pub use self::int::*;
 pub use self::label::*;
-pub use self::methods::*;
+pub(crate) use self::methods::*;
 pub use self::module::*;
 pub use self::none::*;
 pub use self::plugin::*;
@@ -288,7 +290,7 @@ pub fn eval(
     let dict = scope;
     let mut scope = Scope::new();
     for (key, value) in dict {
-        scope.define(key, value);
+        scope.define_spanned(key, value, span);
     }
     crate::eval::eval_string(engine.world, &text, span, mode, scope)
 }

@@ -1,25 +1,30 @@
 use std::borrow::Cow;
 use std::num::NonZeroUsize;
+use std::ops::RangeInclusive;
 use std::ptr;
 use std::str::FromStr;
+
+use comemo::Track;
 
 use crate::diag::{bail, SourceResult};
 use crate::engine::Engine;
 use crate::foundations::{
-    cast, elem, AutoValue, Cast, Content, Dict, Fold, Func, NativeElement, Packed,
-    Resolve, Smart, StyleChain, Value,
+    cast, elem, AutoValue, Cast, Content, Context, Dict, Fold, Func, NativeElement,
+    Packed, Resolve, Smart, StyleChain, Value,
 };
-use crate::introspection::{Counter, CounterKey, ManualPageCounter};
+use crate::introspection::{
+    Counter, CounterDisplayElem, CounterKey, Locator, ManualPageCounter, SplitLocator,
+};
 use crate::layout::{
-    Abs, AlignElem, Alignment, Axes, ColumnsElem, Dir, Frame, HAlignment, LayoutMultiple,
-    Length, OuterVAlignment, Point, Ratio, Regions, Rel, Sides, Size, SpecificAlignment,
+    Abs, AlignElem, Alignment, Axes, ColumnsElem, Dir, Frame, HAlignment, Length,
+    OuterVAlignment, Point, Ratio, Regions, Rel, Sides, Size, SpecificAlignment,
     VAlignment,
 };
 
 use crate::model::Numbering;
 use crate::text::TextElem;
-use crate::util::{NonZeroExt, Numeric, Scalar};
-use crate::visualize::Paint;
+use crate::utils::{NonZeroExt, Numeric, Scalar};
+use crate::visualize::{Color, Paint};
 
 /// Layouts its child onto one or multiple pages.
 ///
@@ -173,12 +178,20 @@ pub struct PageElem {
     #[default(NonZeroUsize::ONE)]
     pub columns: NonZeroUsize,
 
-    /// The page's background color.
+    /// The page's background fill.
     ///
-    /// This instructs the printer to color the complete page with the given
-    /// color. If you are considering larger production runs, it may be more
-    /// environmentally friendly and cost-effective to source pre-dyed pages and
-    /// not set this property.
+    /// Setting this to something non-transparent instructs the printer to color
+    /// the complete page. If you are considering larger production runs, it may
+    /// be more environmentally friendly and cost-effective to source pre-dyed
+    /// pages and not set this property.
+    ///
+    /// When set to `{none}`, the background becomes transparent. Note that PDF
+    /// pages will still appear with a (usually white) background in viewers,
+    /// but they are conceptually transparent. (If you print them, no color is
+    /// used for the background.)
+    ///
+    /// The default of `{auto}` results in `{none}` for PDF output, and
+    /// `{white}` for PNG and SVG.
     ///
     /// ```example
     /// #set page(fill: rgb("444352"))
@@ -186,7 +199,7 @@ pub struct PageElem {
     /// *Dark mode enabled.*
     /// ```
     #[borrowed]
-    pub fill: Option<Paint>,
+    pub fill: Smart<Option<Paint>>,
 
     /// How to [number]($numbering) the pages.
     ///
@@ -226,6 +239,11 @@ pub struct PageElem {
 
     /// The page's header. Fills the top margin of each page.
     ///
+    /// - Content: Shows the content as the header.
+    /// - `{auto}`: Shows the page number if a `numbering` is set and
+    ///   `number-align` is `top`.
+    /// - `{none}`: Suppresses the header.
+    ///
     /// ```example
     /// #set par(justify: true)
     /// #set page(
@@ -240,7 +258,7 @@ pub struct PageElem {
     /// #lorem(19)
     /// ```
     #[borrowed]
-    pub header: Option<Content>,
+    pub header: Smart<Option<Content>>,
 
     /// The amount the header is raised into the top margin.
     #[resolve]
@@ -249,8 +267,13 @@ pub struct PageElem {
 
     /// The page's footer. Fills the bottom margin of each page.
     ///
-    /// For just a page number, the `numbering` property, typically suffices. If
-    /// you want to create a custom footer, but still display the page number,
+    /// - Content: Shows the content as the footer.
+    /// - `{auto}`: Shows the page number if a `numbering` is set and
+    ///   `number-align` is `bottom`.
+    /// - `{none}`: Suppresses the footer.
+    ///
+    /// For just a page number, the `numbering` property typically suffices. If
+    /// you want to create a custom footer but still display the page number,
     /// you can directly access the [page counter]($counter).
     ///
     /// ```example
@@ -258,7 +281,7 @@ pub struct PageElem {
     /// #set page(
     ///   height: 100pt,
     ///   margin: 20pt,
-    ///   footer: [
+    ///   footer: context [
     ///     #set align(right)
     ///     #set text(8pt)
     ///     #counter(page).display(
@@ -271,7 +294,7 @@ pub struct PageElem {
     /// #lorem(48)
     /// ```
     #[borrowed]
-    pub footer: Option<Content>,
+    pub footer: Smart<Option<Content>>,
 
     /// The amount the footer is lowered into the bottom margin.
     #[resolve]
@@ -333,13 +356,15 @@ impl Packed<PageElem> {
     /// a fragment consisting of multiple frames, one per output page of this
     /// page run.
     #[typst_macros::time(name = "page", span = self.span())]
-    pub fn layout(
-        &self,
+    pub fn layout<'a>(
+        &'a self,
         engine: &mut Engine,
-        styles: StyleChain,
-        page_counter: &mut ManualPageCounter,
+        locator: Locator<'a>,
+        styles: StyleChain<'a>,
         extend_to: Option<Parity>,
-    ) -> SourceResult<Vec<Page>> {
+    ) -> SourceResult<PageLayout<'a>> {
+        let mut locator = locator.split();
+
         // When one of the lengths is infinite the page fits its content along
         // that axis.
         let width = self.width(styles).unwrap_or(Abs::inf());
@@ -360,17 +385,9 @@ impl Packed<PageElem> {
         let two_sided = margin.two_sided.unwrap_or(false);
         let margin = margin
             .sides
-            .map(|side| side.and_then(Smart::as_custom).unwrap_or(default))
+            .map(|side| side.and_then(Smart::custom).unwrap_or(default))
             .resolve(styles)
             .relative_to(size);
-
-        // Determine the binding.
-        let binding =
-            self.binding(styles)
-                .unwrap_or_else(|| match TextElem::dir_in(styles) {
-                    Dir::LTR => Binding::Left,
-                    _ => Binding::Right,
-                });
 
         // Realize columns.
         let mut child = self.body().clone();
@@ -387,40 +404,85 @@ impl Packed<PageElem> {
         regions.root = true;
 
         // Layout the child.
-        let mut frames = child.layout(engine, styles, regions)?.into_frames();
+        let frames = child
+            .layout(engine, locator.next(&self.span()), styles, regions)?
+            .into_frames();
+
+        Ok(PageLayout {
+            page: self,
+            locator,
+            styles,
+            extend_to,
+            area,
+            margin,
+            two_sided,
+            frames,
+        })
+    }
+}
+
+/// A prepared layout of a page run that can be finalized with access to the
+/// page counter.
+pub struct PageLayout<'a> {
+    page: &'a Packed<PageElem>,
+    locator: SplitLocator<'a>,
+    styles: StyleChain<'a>,
+    extend_to: Option<Parity>,
+    area: Size,
+    margin: Sides<Abs>,
+    two_sided: bool,
+    frames: Vec<Frame>,
+}
+
+impl PageLayout<'_> {
+    /// Finalize the layout with access to the next page counter.
+    #[typst_macros::time(name = "finalize page", span = self.page.span())]
+    pub fn finalize(
+        mut self,
+        engine: &mut Engine,
+        page_counter: &mut ManualPageCounter,
+    ) -> SourceResult<Vec<Page>> {
+        let styles = self.styles;
 
         // Align the child to the pagebreak's parity.
         // Check for page count after adding the pending frames
-        if extend_to
-            .is_some_and(|p| !p.matches(page_counter.physical().get() + frames.len()))
-        {
+        if self.extend_to.is_some_and(|p| {
+            !p.matches(page_counter.physical().get() + self.frames.len())
+        }) {
             // Insert empty page after the current pages.
-            let size = area.map(Abs::is_finite).select(area, Size::zero());
-            frames.push(Frame::hard(size));
+            let size = self.area.map(Abs::is_finite).select(self.area, Size::zero());
+            self.frames.push(Frame::hard(size));
         }
 
-        let fill = self.fill(styles);
-        let foreground = Cow::Borrowed(self.foreground(styles));
-        let background = Cow::Borrowed(self.background(styles));
-        let header_ascent = self.header_ascent(styles);
-        let footer_descent = self.footer_descent(styles);
-        let numbering = self.numbering(styles);
-        let number_align = self.number_align(styles);
-        let mut header = Cow::Borrowed(self.header(styles));
-        let mut footer = Cow::Borrowed(self.footer(styles));
+        let fill = self.page.fill(styles);
+        let foreground = self.page.foreground(styles);
+        let background = self.page.background(styles);
+        let header_ascent = self.page.header_ascent(styles);
+        let footer_descent = self.page.footer_descent(styles);
+        let numbering = self.page.numbering(styles);
+        let number_align = self.page.number_align(styles);
+        let binding =
+            self.page
+                .binding(styles)
+                .unwrap_or_else(|| match TextElem::dir_in(styles) {
+                    Dir::LTR => Binding::Left,
+                    _ => Binding::Right,
+                });
 
         // Construct the numbering (for header or footer).
-        let numbering_marginal = Cow::Owned(numbering.as_ref().map(|numbering| {
+        let numbering_marginal = numbering.as_ref().map(|numbering| {
             let both = match numbering {
                 Numbering::Pattern(pattern) => pattern.pieces() >= 2,
                 Numbering::Func(_) => true,
             };
 
-            let mut counter = Counter::new(CounterKey::Page).display(
-                self.span(),
-                Some(numbering.clone()),
+            let mut counter = CounterDisplayElem::new(
+                Counter::new(CounterKey::Page),
+                Smart::Custom(numbering.clone()),
                 both,
-            );
+            )
+            .pack()
+            .spanned(self.page.span());
 
             // We interpret the Y alignment as selecting header or footer
             // and then ignore it for aligning the actual number.
@@ -429,25 +491,33 @@ impl Packed<PageElem> {
             }
 
             counter
-        }));
+        });
 
-        if matches!(number_align.y(), Some(OuterVAlignment::Top)) {
-            header = if header.is_some() { header } else { numbering_marginal };
+        let header = self.page.header(styles);
+        let footer = self.page.footer(styles);
+        let (header, footer) = if matches!(number_align.y(), Some(OuterVAlignment::Top)) {
+            (
+                header.as_ref().unwrap_or(&numbering_marginal),
+                footer.as_ref().unwrap_or(&None),
+            )
         } else {
-            footer = if footer.is_some() { footer } else { numbering_marginal };
-        }
+            (
+                header.as_ref().unwrap_or(&None),
+                footer.as_ref().unwrap_or(&numbering_marginal),
+            )
+        };
 
         // Post-process pages.
-        let mut pages = Vec::with_capacity(frames.len());
-        for mut frame in frames {
+        let mut pages = Vec::with_capacity(self.frames.len());
+        for mut frame in self.frames {
             // The padded width of the page's content without margins.
             let pw = frame.width();
 
             // If two sided, left becomes inside and right becomes outside.
             // Thus, for left-bound pages, we want to swap on even pages and
             // for right-bound pages, we want to swap on odd pages.
-            let mut margin = margin;
-            if two_sided && binding.swap(page_counter.physical()) {
+            let mut margin = self.margin;
+            if self.two_sided && binding.swap(page_counter.physical()) {
                 std::mem::swap(&mut margin.left, &mut margin.right);
             }
 
@@ -459,16 +529,16 @@ impl Packed<PageElem> {
             let size = frame.size();
 
             // Realize overlays.
-            for marginal in [&header, &footer, &background, &foreground] {
-                let Some(content) = &**marginal else { continue };
+            for marginal in [header, footer, background, foreground] {
+                let Some(content) = marginal.as_ref() else { continue };
 
                 let (pos, area, align);
-                if ptr::eq(marginal, &header) {
+                if ptr::eq(marginal, header) {
                     let ascent = header_ascent.relative_to(margin.top);
                     pos = Point::with_x(margin.left);
                     area = Size::new(pw, margin.top - ascent);
                     align = Alignment::BOTTOM;
-                } else if ptr::eq(marginal, &footer) {
+                } else if ptr::eq(marginal, footer) {
                     let descent = footer_descent.relative_to(margin.bottom);
                     pos = Point::new(margin.left, size.y - margin.bottom + descent);
                     area = Size::new(pw, margin.bottom - descent);
@@ -483,23 +553,20 @@ impl Packed<PageElem> {
                 let sub = content
                     .clone()
                     .styled(AlignElem::set_alignment(align))
-                    .layout(engine, styles, pod)?
+                    .layout(engine, self.locator.next(&content.span()), styles, pod)?
                     .into_frame();
 
-                if ptr::eq(marginal, &header) || ptr::eq(marginal, &background) {
+                if ptr::eq(marginal, header) || ptr::eq(marginal, background) {
                     frame.prepend_frame(pos, sub);
                 } else {
                     frame.push_frame(pos, sub);
                 }
             }
 
-            if let Some(fill) = fill {
-                frame.fill(fill.clone());
-            }
-
             page_counter.visit(engine, &frame)?;
             pages.push(Page {
                 frame,
+                fill: fill.clone(),
                 numbering: numbering.clone(),
                 number: page_counter.logical(),
             });
@@ -512,10 +579,19 @@ impl Packed<PageElem> {
 }
 
 /// A finished page.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct Page {
     /// The frame that defines the page.
     pub frame: Frame,
+    /// How the page is filled.
+    ///
+    /// - When `None`, the background is transparent.
+    /// - When `Auto`, the background is transparent for PDF and white
+    ///   for raster and SVG targets.
+    ///
+    /// Exporters should access the resolved value of this property through
+    /// `fill_or_transparent()` or `fill_or_white()`.
+    pub fill: Smart<Option<Paint>>,
     /// The page's numbering.
     pub numbering: Option<Numbering>,
     /// The logical page number (controlled by `counter(page)` and may thus not
@@ -523,8 +599,24 @@ pub struct Page {
     pub number: usize,
 }
 
+impl Page {
+    /// Get the configured background or `None` if it is `Auto`.
+    ///
+    /// This is used in PDF export.
+    pub fn fill_or_transparent(&self) -> Option<Paint> {
+        self.fill.clone().unwrap_or(None)
+    }
+
+    /// Get the configured background or white if it is `Auto`.
+    ///
+    /// This is used in raster and SVG export.
+    pub fn fill_or_white(&self) -> Option<Paint> {
+        self.fill.clone().unwrap_or_else(|| Some(Color::WHITE.into()))
+    }
+}
+
 /// Specification of the page's margins.
-#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub struct Margin {
     /// The margins for each side.
     pub sides: Sides<Option<Smart<Rel<Length>>>>,
@@ -540,6 +632,15 @@ impl Margin {
     }
 }
 
+impl Default for Margin {
+    fn default() -> Self {
+        Self {
+            sides: Sides::splat(Some(Smart::Auto)),
+            two_sided: None,
+        }
+    }
+}
+
 impl Fold for Margin {
     fn fold(self, outer: Self) -> Self {
         Margin {
@@ -552,22 +653,28 @@ impl Fold for Margin {
 cast! {
     Margin,
     self => {
+        let two_sided = self.two_sided.unwrap_or(false);
+        if !two_sided && self.sides.is_uniform() {
+            if let Some(left) = self.sides.left {
+                return left.into_value();
+            }
+        }
+
         let mut dict = Dict::new();
-        let mut handle = |key: &str, component: Value| {
-            let value = component.into_value();
-            if value != Value::None {
-                dict.insert(key.into(), value);
+        let mut handle = |key: &str, component: Option<Smart<Rel<Length>>>| {
+            if let Some(c) = component {
+                dict.insert(key.into(), c.into_value());
             }
         };
 
-        handle("top", self.sides.top.into_value());
-        handle("bottom", self.sides.bottom.into_value());
-        if self.two_sided.unwrap_or(false) {
-            handle("inside", self.sides.left.into_value());
-            handle("outside", self.sides.right.into_value());
+        handle("top", self.sides.top);
+        handle("bottom", self.sides.bottom);
+        if two_sided {
+            handle("inside", self.sides.left);
+            handle("outside", self.sides.right);
         } else {
-            handle("left", self.sides.left.into_value());
-            handle("right", self.sides.right.into_value());
+            handle("left", self.sides.left);
+            handle("right", self.sides.right);
         }
 
         Value::Dict(dict)
@@ -668,11 +775,15 @@ impl Marginal {
     pub fn resolve(
         &self,
         engine: &mut Engine,
+        styles: StyleChain,
         page: usize,
     ) -> SourceResult<Cow<'_, Content>> {
         Ok(match self {
             Self::Content(content) => Cow::Borrowed(content),
-            Self::Func(func) => Cow::Owned(func.call(engine, [page])?.display()),
+            Self::Func(func) => Cow::Owned(
+                func.call(engine, Context::new(None, Some(styles)).track(), [page])?
+                    .display(),
+            ),
         })
     }
 }
@@ -685,6 +796,39 @@ cast! {
     },
     v: Content => Self::Content(v),
     v: Func => Self::Func(v),
+}
+
+/// A list of page ranges to be exported. The ranges are one-indexed.
+/// For example, `1..=3` indicates the first, second and third pages should be
+/// exported.
+pub struct PageRanges(Vec<PageRange>);
+
+pub type PageRange = RangeInclusive<Option<NonZeroUsize>>;
+
+impl PageRanges {
+    pub fn new(ranges: Vec<PageRange>) -> Self {
+        Self(ranges)
+    }
+
+    /// Check if a page, given its number, should be included when exporting the
+    /// document while restricting the exported pages to these page ranges.
+    /// This is the one-indexed version of 'includes_page_index'.
+    pub fn includes_page(&self, page: NonZeroUsize) -> bool {
+        self.includes_page_index(page.get() - 1)
+    }
+
+    /// Check if a page, given its index, should be included when exporting the
+    /// document while restricting the exported pages to these page ranges.
+    /// This is the zero-indexed version of 'includes_page'.
+    pub fn includes_page_index(&self, page: usize) -> bool {
+        let page = NonZeroUsize::try_from(page + 1).unwrap();
+        self.0.iter().any(|range| match (range.start(), range.end()) {
+            (Some(start), Some(end)) => (start..=end).contains(&&page),
+            (Some(start), None) => (start..).contains(&&page),
+            (None, Some(end)) => (..=end).contains(&&page),
+            (None, None) => true,
+        })
+    }
 }
 
 /// A manual page break.

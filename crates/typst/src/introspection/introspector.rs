@@ -10,13 +10,13 @@ use smallvec::SmallVec;
 
 use crate::diag::{bail, StrResult};
 use crate::foundations::{Content, Label, Repr, Selector};
-use crate::introspection::{Location, Meta};
+use crate::introspection::Location;
 use crate::layout::{Frame, FrameItem, Page, Point, Position, Transform};
 use crate::model::Numbering;
-use crate::util::NonZeroExt;
+use crate::utils::NonZeroExt;
 
 /// Can be queried for elements and their positions.
-#[derive(Clone)]
+#[derive(Default, Clone)]
 pub struct Introspector {
     /// The number of pages in the document.
     pages: usize,
@@ -25,6 +25,9 @@ pub struct Introspector {
     /// Maps labels to their indices in the element list. We use a smallvec such
     /// that if the label is unique, we don't need to allocate.
     labels: HashMap<Label, SmallVec<[usize; 1]>>,
+    /// Maps from element keys to the locations of all elements that had this
+    /// key. Used for introspector-assisted location assignment.
+    keys: HashMap<u128, SmallVec<[Location; 1]>>,
     /// The page numberings, indexed by page number minus 1.
     page_numberings: Vec<Option<Numbering>>,
     /// Caches queries done on the introspector. This is important because
@@ -41,6 +44,7 @@ impl Introspector {
         self.pages = pages.len();
         self.elems.clear();
         self.labels.clear();
+        self.keys.clear();
         self.page_numberings.clear();
         self.queries.clear();
 
@@ -61,18 +65,21 @@ impl Introspector {
                         .pre_concat(group.transform);
                     self.extract(&group.frame, page, ts);
                 }
-                FrameItem::Meta(Meta::Elem(content), _)
-                    if !self.elems.contains_key(&content.location().unwrap()) =>
+                FrameItem::Tag(tag)
+                    if !self.elems.contains_key(&tag.elem.location().unwrap()) =>
                 {
                     let pos = pos.transform(ts);
-                    let ret = self.elems.insert(
-                        content.location().unwrap(),
-                        (content.clone(), Position { page, point: pos }),
-                    );
+                    let loc = tag.elem.location().unwrap();
+                    let ret = self
+                        .elems
+                        .insert(loc, (tag.elem.clone(), Position { page, point: pos }));
                     assert!(ret.is_none(), "duplicate locations");
 
+                    // Build the key map.
+                    self.keys.entry(tag.key).or_default().push(loc);
+
                     // Build the label cache.
-                    if let Some(label) = content.label() {
+                    if let Some(label) = tag.elem.label() {
                         self.labels.entry(label).or_default().push(self.elems.len() - 1);
                     }
                 }
@@ -86,21 +93,24 @@ impl Introspector {
         self.elems.values().map(|(c, _)| c)
     }
 
+    /// Perform a binary search for `elem` among the `list`.
+    fn binary_search(&self, list: &[Content], elem: &Content) -> Result<usize, usize> {
+        list.binary_search_by_key(&self.elem_index(elem), |elem| self.elem_index(elem))
+    }
+
     /// Get an element by its location.
     fn get(&self, location: &Location) -> Option<&Content> {
         self.elems.get(location).map(|(elem, _)| elem)
     }
 
     /// Get the index of this element among all.
-    fn index(&self, elem: &Content) -> usize {
-        self.elems
-            .get_index_of(&elem.location().unwrap())
-            .unwrap_or(usize::MAX)
+    fn elem_index(&self, elem: &Content) -> usize {
+        self.loc_index(&elem.location().unwrap())
     }
 
-    /// Perform a binary search for `elem` among the `list`.
-    fn binary_search(&self, list: &[Content], elem: &Content) -> Result<usize, usize> {
-        list.binary_search_by_key(&self.index(elem), |elem| self.index(elem))
+    /// Get the index of the element with this location among all.
+    fn loc_index(&self, location: &Location) -> usize {
+        self.elems.get_index_of(location).unwrap_or(usize::MAX)
     }
 }
 
@@ -108,7 +118,7 @@ impl Introspector {
 impl Introspector {
     /// Query for all matching elements.
     pub fn query(&self, selector: &Selector) -> EcoVec<Content> {
-        let hash = crate::util::hash128(selector);
+        let hash = crate::utils::hash128(selector);
         if let Some(output) = self.queries.get(hash) {
             return output;
         }
@@ -121,7 +131,7 @@ impl Introspector {
                     indices.iter().map(|&index| self.elems[index].0.clone()).collect()
                 })
                 .unwrap_or_default(),
-            Selector::Elem(..) | Selector::Regex(_) | Selector::Can(_) => self
+            Selector::Elem(..) | Selector::Can(_) => self
                 .all()
                 .filter(|elem| selector.matches(elem, None))
                 .cloned()
@@ -183,11 +193,13 @@ impl Introspector {
             Selector::Or(selectors) => selectors
                 .iter()
                 .flat_map(|sel| self.query(sel))
-                .map(|elem| self.index(&elem))
+                .map(|elem| self.elem_index(&elem))
                 .collect::<BTreeSet<usize>>()
                 .into_iter()
                 .map(|index| self.elems[index].0.clone())
                 .collect(),
+            // Not supported here.
+            Selector::Regex(_) => EcoVec::new(),
         };
 
         self.queries.insert(hash, output.clone());
@@ -198,7 +210,33 @@ impl Introspector {
     pub fn query_first(&self, selector: &Selector) -> Option<Content> {
         match selector {
             Selector::Location(location) => self.get(location).cloned(),
+            Selector::Label(label) => self
+                .labels
+                .get(label)
+                .and_then(|indices| indices.first())
+                .map(|&index| self.elems[index].0.clone()),
             _ => self.query(selector).first().cloned(),
+        }
+    }
+
+    /// Query for the first element that matches the selector.
+    pub fn query_unique(&self, selector: &Selector) -> StrResult<Content> {
+        match selector {
+            Selector::Location(location) => self
+                .get(location)
+                .cloned()
+                .ok_or_else(|| "element does not exist in the document".into()),
+            Selector::Label(label) => self.query_label(*label).cloned(),
+            _ => {
+                let elems = self.query(selector);
+                if elems.len() > 1 {
+                    bail!("selector matches multiple elements",);
+                }
+                elems
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| "selector does not match any element".into())
+            }
         }
     }
 
@@ -213,6 +251,21 @@ impl Introspector {
         }
 
         Ok(&self.elems[indices[0]].0)
+    }
+
+    /// This is an optimized version of
+    /// `query(selector.before(end, true).len()` used by counters and state.
+    pub fn query_count_before(&self, selector: &Selector, end: Location) -> usize {
+        // See `query()` for details.
+        let list = self.query(selector);
+        if let Some(end) = self.get(&end) {
+            match self.binary_search(&list, end) {
+                Ok(i) => i + 1,
+                Err(i) => i,
+            }
+        } else {
+            list.len()
+        }
     }
 
     /// The total number pages.
@@ -237,20 +290,23 @@ impl Introspector {
     pub fn position(&self, location: Location) -> Position {
         self.elems
             .get(&location)
-            .map(|(_, loc)| *loc)
+            .map(|&(_, pos)| pos)
             .unwrap_or(Position { page: NonZeroUsize::ONE, point: Point::zero() })
     }
-}
 
-impl Default for Introspector {
-    fn default() -> Self {
-        Self {
-            pages: 0,
-            elems: IndexMap::new(),
-            labels: HashMap::new(),
-            page_numberings: vec![],
-            queries: QueryCache::default(),
-        }
+    /// Try to find a location for an element with the given `key` hash
+    /// that is closest after the `anchor`.
+    ///
+    /// This is used for introspector-assisted location assignment during
+    /// measurement. See the "Dealing with Measurement" section of the
+    /// [`Locator`](crate::introspection::Locator) docs for more details.
+    pub fn locator(&self, key: u128, anchor: Location) -> Option<Location> {
+        let anchor = self.loc_index(&anchor);
+        self.keys
+            .get(&key)?
+            .iter()
+            .copied()
+            .min_by_key(|loc| self.loc_index(loc).wrapping_sub(anchor))
     }
 }
 

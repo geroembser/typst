@@ -1,11 +1,13 @@
 use std::str::FromStr;
 
 use chinese_number::{ChineseCase, ChineseCountMethod, ChineseVariant, NumberToChinese};
+use comemo::Tracked;
 use ecow::{eco_format, EcoString, EcoVec};
+use smallvec::{smallvec, SmallVec};
 
 use crate::diag::SourceResult;
 use crate::engine::Engine;
-use crate::foundations::{cast, func, Func, Str, Value};
+use crate::foundations::{cast, func, Context, Func, Str, Value};
 use crate::text::Case;
 
 /// Applies a numbering to a sequence of numbers.
@@ -35,6 +37,8 @@ use crate::text::Case;
 pub fn numbering(
     /// The engine.
     engine: &mut Engine,
+    /// The callsite context.
+    context: Tracked<Context>,
     /// Defines how the numbering works.
     ///
     /// **Counting symbols** are `1`, `a`, `A`, `i`, `I`, `一`, `壹`, `あ`, `い`, `ア`, `イ`, `א`, `가`,
@@ -66,7 +70,7 @@ pub fn numbering(
     #[variadic]
     numbers: Vec<usize>,
 ) -> SourceResult<Value> {
-    numbering.apply(engine, &numbers)
+    numbering.apply(engine, context, &numbers)
 }
 
 /// How to number a sequence of things.
@@ -80,10 +84,15 @@ pub enum Numbering {
 
 impl Numbering {
     /// Apply the pattern to the given numbers.
-    pub fn apply(&self, engine: &mut Engine, numbers: &[usize]) -> SourceResult<Value> {
+    pub fn apply(
+        &self,
+        engine: &mut Engine,
+        context: Tracked<Context>,
+        numbers: &[usize],
+    ) -> SourceResult<Value> {
         Ok(match self {
             Self::Pattern(pattern) => Value::Str(pattern.apply(numbers).into()),
-            Self::Func(func) => func.call(engine, numbers.iter().copied())?,
+            Self::Func(func) => func.call(engine, context, numbers.iter().copied())?,
         })
     }
 
@@ -115,7 +124,7 @@ cast! {
 /// How to turn a number into text.
 ///
 /// A pattern consists of a prefix, followed by one of
-/// `1`, `a`, `A`, `i`, `I`, `一`, `壹`, `あ`, `い`, `ア`, `イ`, `א`, `가`, `ㄱ`, or `*`,
+/// `1`, `a`, `A`, `i`, `I`, `一`, `壹`, `あ`, `い`, `ア`, `イ`, `א`, `가`, `ㄱ`, `*`, `①`, or `⓵`,
 /// and then a suffix.
 ///
 /// Examples of valid patterns:
@@ -235,11 +244,17 @@ cast! {
 /// Different kinds of numberings.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub enum NumberingKind {
+    /// Arabic numerals (1, 2, 3, etc.).
     Arabic,
+    /// Latin letters (A, B, C, etc.). Items beyond Z use multiple symbols. Uses both cases.
     Letter,
+    /// Roman numerals (I, II, III, etc.). Uses both cases.
     Roman,
+    /// The symbols *, †, ‡, §, ¶, and ‖. Further items use multiple symbols.
     Symbol,
+    /// Hebrew numerals.
     Hebrew,
+    /// Simplified Chinese numerals. Uses standard numerals for lowercase and “banknote” numerals for uppercase.
     SimplifiedChinese,
     // TODO: Pick the numbering pattern based on languages choice.
     // As the `1st` numbering character of Chinese (Simplified) and
@@ -247,13 +262,28 @@ pub enum NumberingKind {
     // if the context is Simplified or Traditional by only this
     // character.
     #[allow(unused)]
+    /// Traditional Chinese numerals. Uses standard numerals for lowercase and “banknote” numerals for uppercase.
     TraditionalChinese,
+    /// Hiragana in the gojūon order. Includes n but excludes wi and we.
     HiraganaAiueo,
+    /// Hiragana in the iroha order. Includes wi and we but excludes n.
     HiraganaIroha,
+    /// Katakana in the gojūon order. Includes n but excludes wi and we.
     KatakanaAiueo,
+    /// Katakana in the iroha order. Includes wi and we but excludes n.
     KatakanaIroha,
+    /// Korean jamo (ㄱ, ㄴ, ㄷ, etc.).
     KoreanJamo,
+    /// Korean syllables (가, 나, 다, etc.).
     KoreanSyllable,
+    /// Eastern Arabic numerals, used in some Arabic-speaking countries.
+    EasternArabic,
+    /// The variant of Eastern Arabic numerals used in Persian and Urdu.
+    EasternArabicPersian,
+    /// Circled numbers (①, ②, ③, etc.), up to 50.
+    CircledNumber,
+    /// Double-circled numbers (⓵, ⓶, ⓷, etc.), up to 10.
+    DoubleCircledNumber,
 }
 
 impl NumberingKind {
@@ -272,6 +302,10 @@ impl NumberingKind {
             'イ' => NumberingKind::KatakanaIroha,
             'ㄱ' => NumberingKind::KoreanJamo,
             '가' => NumberingKind::KoreanSyllable,
+            '\u{0661}' => NumberingKind::EasternArabic,
+            '\u{06F1}' => NumberingKind::EasternArabicPersian,
+            '①' => NumberingKind::CircledNumber,
+            '⓵' => NumberingKind::DoubleCircledNumber,
             _ => return None,
         })
     }
@@ -292,6 +326,10 @@ impl NumberingKind {
             Self::KatakanaIroha => 'イ',
             Self::KoreanJamo => 'ㄱ',
             Self::KoreanSyllable => '가',
+            Self::EasternArabic => '\u{0661}',
+            Self::EasternArabicPersian => '\u{06F1}',
+            Self::CircledNumber => '①',
+            Self::DoubleCircledNumber => '⓵',
         }
     }
 
@@ -499,6 +537,24 @@ impl NumberingKind {
                 },
                 n,
             ),
+            Self::EasternArabic => decimal('\u{0660}', n),
+            Self::EasternArabicPersian => decimal('\u{06F0}', n),
+            Self::CircledNumber => zeroless::<50>(
+                |x| {
+                    [
+                        '①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨', '⑩', '⑪', '⑫', '⑬',
+                        '⑭', '⑮', '⑯', '⑰', '⑱', '⑲', '⑳', '㉑', '㉒', '㉓', '㉔', '㉕',
+                        '㉖', '㉗', '㉘', '㉙', '㉚', '㉛', '㉜', '㉝', '㉞', '㉟', '㊱',
+                        '㊲', '㊳', '㊴', '㊵', '㊶', '㊷', '㊸', '㊹', '㊺', '㊻', '㊼',
+                        '㊽', '㊾', '㊿',
+                    ][x]
+                },
+                n,
+            ),
+            Self::DoubleCircledNumber => zeroless::<10>(
+                |x| ['⓵', '⓶', '⓷', '⓸', '⓹', '⓺', '⓻', '⓼', '⓽', '⓾'][x],
+                n,
+            ),
         }
     }
 }
@@ -534,11 +590,26 @@ fn zeroless<const N_DIGITS: usize>(
     if n == 0 {
         return '-'.into();
     }
-    let mut cs = vec![];
+    let mut cs: SmallVec<[char; 8]> = smallvec![];
     while n > 0 {
         n -= 1;
         cs.push(mk_digit(n % N_DIGITS));
         n /= N_DIGITS;
+    }
+    cs.into_iter().rev().collect()
+}
+
+/// Stringify a number using a base-10 counting system with a zero digit.
+///
+/// This function assumes that the digits occupy contiguous codepoints.
+fn decimal(start: char, mut n: usize) -> EcoString {
+    if n == 0 {
+        return start.into();
+    }
+    let mut cs: SmallVec<[char; 8]> = smallvec![];
+    while n > 0 {
+        cs.push(char::from_u32((start as u32) + ((n % 10) as u32)).unwrap());
+        n /= 10;
     }
     cs.into_iter().rev().collect()
 }

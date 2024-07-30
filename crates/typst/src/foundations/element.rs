@@ -2,6 +2,7 @@ use std::any::TypeId;
 use std::cmp::Ordering;
 use std::fmt::{self, Debug};
 use std::hash::Hash;
+use std::ptr::NonNull;
 
 use ecow::EcoString;
 use once_cell::sync::Lazy;
@@ -10,11 +11,11 @@ use smallvec::SmallVec;
 use crate::diag::SourceResult;
 use crate::engine::Engine;
 use crate::foundations::{
-    cast, Args, Content, Dict, Func, ParamInfo, Repr, Scope, Selector, StyleChain,
-    Styles, Value,
+    cast, Args, Content, Dict, FieldAccessError, Func, ParamInfo, Repr, Scope, Selector,
+    StyleChain, Styles, Value,
 };
 use crate::text::{Lang, Region};
-use crate::util::Static;
+use crate::utils::Static;
 
 #[doc(inline)]
 pub use typst_macros::elem;
@@ -27,22 +28,6 @@ impl Element {
     /// Get the element for `T`.
     pub fn of<T: NativeElement>() -> Self {
         T::elem()
-    }
-
-    /// Extract the field ID for the given field name.
-    pub fn field_id(&self, name: &str) -> Option<u8> {
-        if name == "label" {
-            return Some(255);
-        }
-        (self.0.field_id)(name)
-    }
-
-    /// Extract the field name for the given field ID.
-    pub fn field_name(&self, id: u8) -> Option<&'static str> {
-        if id == 255 {
-            return Some("label");
-        }
-        (self.0.field_name)(id)
     }
 
     /// The element's normal name (e.g. `enum`).
@@ -97,7 +82,7 @@ impl Element {
     }
 
     /// The VTable for capabilities dispatch.
-    pub fn vtable(self) -> fn(of: TypeId) -> Option<*const ()> {
+    pub fn vtable(self) -> fn(of: TypeId) -> Option<NonNull<()>> {
         self.0.vtable
     }
 
@@ -120,6 +105,31 @@ impl Element {
     /// Details about the element's fields.
     pub fn params(&self) -> &'static [ParamInfo] {
         &(self.0).0.params
+    }
+
+    /// Extract the field ID for the given field name.
+    pub fn field_id(&self, name: &str) -> Option<u8> {
+        if name == "label" {
+            return Some(255);
+        }
+        (self.0.field_id)(name)
+    }
+
+    /// Extract the field name for the given field ID.
+    pub fn field_name(&self, id: u8) -> Option<&'static str> {
+        if id == 255 {
+            return Some("label");
+        }
+        (self.0.field_name)(id)
+    }
+
+    /// Extract the value of the field for the given field ID and style chain.
+    pub fn field_from_styles(
+        &self,
+        id: u8,
+        styles: StyleChain,
+    ) -> Result<Value, FieldAccessError> {
+        (self.0.field_from_styles)(id, styles)
     }
 
     /// The element's local name, if any.
@@ -203,7 +213,7 @@ pub trait NativeElement:
 /// `TypeId::of::<dyn C>()`.
 pub unsafe trait Capable {
     /// Get the pointer to the vtable for the given capability / trait.
-    fn vtable(capability: TypeId) -> Option<*const ()>;
+    fn vtable(capability: TypeId) -> Option<NonNull<()>>;
 }
 
 /// Defines how fields of an element are accessed.
@@ -217,10 +227,19 @@ pub trait Fields {
     fn has(&self, id: u8) -> bool;
 
     /// Get the field with the given field ID.
-    fn field(&self, id: u8) -> Option<Value>;
+    fn field(&self, id: u8) -> Result<Value, FieldAccessError>;
 
     /// Get the field with the given ID in the presence of styles.
-    fn field_with_styles(&self, id: u8, styles: StyleChain) -> Option<Value>;
+    fn field_with_styles(
+        &self,
+        id: u8,
+        styles: StyleChain,
+    ) -> Result<Value, FieldAccessError>;
+
+    /// Get the field with the given ID from the styles.
+    fn field_from_styles(id: u8, styles: StyleChain) -> Result<Value, FieldAccessError>
+    where
+        Self: Sized;
 
     /// Resolve all fields with the styles and save them in-place.
     fn materialize(&mut self, styles: StyleChain);
@@ -251,17 +270,31 @@ pub trait Set {
 /// Defines a native element.
 #[derive(Debug)]
 pub struct NativeElementData {
+    /// The element's normal name (e.g. `align`), as exposed to Typst.
     pub name: &'static str,
+    /// The element's title case name (e.g. `Align`).
     pub title: &'static str,
+    /// The documentation for this element as a string.
     pub docs: &'static str,
+    /// A list of alternate search terms for this element.
     pub keywords: &'static [&'static str],
+    /// The constructor for this element (see [`Construct`]).
     pub construct: fn(&mut Engine, &mut Args) -> SourceResult<Content>,
+    /// Executes this element's set rule (see [`Set`]).
     pub set: fn(&mut Engine, &mut Args) -> SourceResult<Styles>,
-    pub vtable: fn(capability: TypeId) -> Option<*const ()>,
+    /// Gets the vtable for one of this element's capabilities
+    /// (see [`Capable`]).
+    pub vtable: fn(capability: TypeId) -> Option<NonNull<()>>,
+    /// Gets the numeric index of this field by its name.
     pub field_id: fn(name: &str) -> Option<u8>,
+    /// Gets the name of a field by its numeric index.
     pub field_name: fn(u8) -> Option<&'static str>,
+    /// Get the field with the given ID in the presence of styles (see [`Fields`]).
+    pub field_from_styles: fn(u8, StyleChain) -> Result<Value, FieldAccessError>,
+    /// Gets the localized name for this element (see [`LocalName`][crate::text::LocalName]).
     pub local_name: Option<fn(Lang, Option<Region>) -> &'static str>,
     pub scope: Lazy<Scope>,
+    /// A list of parameter information for each field.
     pub params: Lazy<Vec<ParamInfo>>,
 }
 

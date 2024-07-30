@@ -10,6 +10,8 @@ use crate::math::{
 };
 use crate::text::TextElem;
 
+use super::delimiter_alignment;
+
 /// How much less high scaled delimiters can be than what they wrap.
 pub(super) const DELIM_SHORT_FALL: Em = Em::new(0.1);
 
@@ -122,10 +124,12 @@ impl LayoutMath for Packed<MidElem> {
                 MathFragment::Glyph(glyph) => {
                     let mut new = glyph.clone().into_variant();
                     new.mid_stretched = Some(false);
+                    new.class = MathClass::Fence;
                     *fragment = MathFragment::Variant(new);
                 }
                 MathFragment::Variant(variant) => {
                     variant.mid_stretched = Some(false);
+                    variant.class = MathClass::Fence;
                 }
                 _ => {}
             }
@@ -158,7 +162,7 @@ fn scale(
 
         let short_fall = DELIM_SHORT_FALL.at(glyph.font_size);
         let mut stretched = glyph.stretch_vertical(ctx, height, short_fall);
-        stretched.center_on_axis(ctx);
+        stretched.align_on_axis(ctx, delimiter_alignment(stretched.c));
 
         *fragment = MathFragment::Variant(stretched);
         if let Some(class) = apply {

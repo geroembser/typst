@@ -5,20 +5,22 @@ use ecow::{eco_format, EcoString};
 use if_chain::if_chain;
 use serde::{Deserialize, Serialize};
 use typst::foundations::{
-    fields_on, format_str, mutable_methods_on, repr, AutoValue, CastInfo, Func, Label,
-    NoneValue, Repr, Scope, Type, Value,
+    fields_on, format_str, repr, AutoValue, CastInfo, Func, Label, NoneValue, Repr,
+    Scope, StyleChain, Styles, Type, Value,
 };
 use typst::model::Document;
 use typst::syntax::{
-    ast, is_id_continue, is_id_start, is_ident, LinkedNode, Source, SyntaxKind,
+    ast, is_id_continue, is_id_start, is_ident, LinkedNode, Side, Source, SyntaxKind,
 };
 use typst::text::RawElem;
 use typst::visualize::Color;
 use typst::World;
 use unscanny::Scanner;
 
-use crate::analyze::{analyze_expr, analyze_import, analyze_labels};
-use crate::{plain_docs_sentence, summarize_font_family};
+use crate::{
+    analyze_expr, analyze_import, analyze_labels, named_items, plain_docs_sentence,
+    summarize_font_family,
+};
 
 /// Autocomplete a cursor position in a source file.
 ///
@@ -128,6 +130,17 @@ fn complete_markup(ctx: &mut CompletionContext) -> bool {
         if let Some(prev) = ctx.leaf.prev_leaf();
         if prev.kind() == SyntaxKind::Eq;
         if prev.parent_kind() == Some(SyntaxKind::LetBinding);
+        then {
+            ctx.from = ctx.cursor;
+            code_completions(ctx, false);
+            return true;
+        }
+    }
+
+    // Behind a half-completed context block: "#context |".
+    if_chain! {
+        if let Some(prev) = ctx.leaf.prev_leaf();
+        if prev.kind() == SyntaxKind::Context;
         then {
             ctx.from = ctx.cursor;
             code_completions(ctx, false);
@@ -323,6 +336,13 @@ fn math_completions(ctx: &mut CompletionContext) {
 
 /// Complete field accesses.
 fn complete_field_accesses(ctx: &mut CompletionContext) -> bool {
+    // Used to determine whether trivia nodes are allowed before '.'.
+    // During an inline expression in markup mode trivia nodes exit the inline expression.
+    let in_markup: bool = matches!(
+        ctx.leaf.parent_kind(),
+        None | Some(SyntaxKind::Markup) | Some(SyntaxKind::Ref)
+    );
+
     // Behind an expression plus dot: "emoji.|".
     if_chain! {
         if ctx.leaf.kind() == SyntaxKind::Dot
@@ -330,13 +350,14 @@ fn complete_field_accesses(ctx: &mut CompletionContext) -> bool {
                 && ctx.leaf.text() == ".");
         if ctx.leaf.range().end == ctx.cursor;
         if let Some(prev) = ctx.leaf.prev_sibling();
+        if !in_markup || prev.range().end == ctx.leaf.range().start;
         if prev.is::<ast::Expr>();
         if prev.parent_kind() != Some(SyntaxKind::Markup) ||
            prev.prev_sibling_kind() == Some(SyntaxKind::Hash);
-        if let Some(value) = analyze_expr(ctx.world, &prev).into_iter().next();
+        if let Some((value, styles)) = analyze_expr(ctx.world, &prev).into_iter().next();
         then {
             ctx.from = ctx.cursor;
-            field_access_completions(ctx, &value);
+            field_access_completions(ctx, &value, &styles);
             return true;
         }
     }
@@ -348,10 +369,10 @@ fn complete_field_accesses(ctx: &mut CompletionContext) -> bool {
         if prev.kind() == SyntaxKind::Dot;
         if let Some(prev_prev) = prev.prev_sibling();
         if prev_prev.is::<ast::Expr>();
-        if let Some(value) = analyze_expr(ctx.world, &prev_prev).into_iter().next();
+        if let Some((value, styles)) = analyze_expr(ctx.world, &prev_prev).into_iter().next();
         then {
             ctx.from = ctx.leaf.offset();
-            field_access_completions(ctx, &value);
+            field_access_completions(ctx, &value, &styles);
             return true;
         }
     }
@@ -360,28 +381,19 @@ fn complete_field_accesses(ctx: &mut CompletionContext) -> bool {
 }
 
 /// Add completions for all fields on a value.
-fn field_access_completions(ctx: &mut CompletionContext, value: &Value) {
-    for (name, value) in value.ty().scope().iter() {
+fn field_access_completions(
+    ctx: &mut CompletionContext,
+    value: &Value,
+    styles: &Option<Styles>,
+) {
+    for (name, value, _) in value.ty().scope().iter() {
         ctx.value_completion(Some(name.clone()), value, true, None);
     }
 
     if let Some(scope) = value.scope() {
-        for (name, value) in scope.iter() {
+        for (name, value, _) in scope.iter() {
             ctx.value_completion(Some(name.clone()), value, true, None);
         }
-    }
-
-    for &(method, args) in mutable_methods_on(value.ty()) {
-        ctx.completions.push(Completion {
-            kind: CompletionKind::Func,
-            label: method.into(),
-            apply: Some(if args {
-                eco_format!("{method}(${{}})")
-            } else {
-                eco_format!("{method}()${{}}")
-            }),
-            detail: None,
-        })
     }
 
     for &field in fields_on(value.ty()) {
@@ -419,6 +431,23 @@ fn field_access_completions(ctx: &mut CompletionContext, value: &Value) {
         Value::Dict(dict) => {
             for (name, value) in dict.iter() {
                 ctx.value_completion(Some(name.clone().into()), value, false, None);
+            }
+        }
+        Value::Func(func) => {
+            // Autocomplete get rules.
+            if let Some((elem, styles)) = func.element().zip(styles.as_ref()) {
+                for param in elem.params().iter().filter(|param| !param.required) {
+                    if let Some(value) = elem.field_id(param.name).and_then(|id| {
+                        elem.field_from_styles(id, StyleChain::new(styles)).ok()
+                    }) {
+                        ctx.value_completion(
+                            Some(param.name.into()),
+                            &value,
+                            false,
+                            None,
+                        );
+                    }
+                }
             }
         }
         Value::Plugin(plugin) => {
@@ -515,7 +544,7 @@ fn import_item_completions<'a>(
         ctx.snippet_completion("*", "*", "Import everything.");
     }
 
-    for (name, value) in scope.iter() {
+    for (name, value, _) in scope.iter() {
         if existing.iter().all(|item| item.original_name().as_str() != name) {
             ctx.value_completion(Some(name.clone()), value, false, None);
         }
@@ -863,6 +892,12 @@ fn code_completions(ctx: &mut CompletionContext, hash: bool) {
     );
 
     ctx.snippet_completion(
+        "context expression",
+        "context ${}",
+        "Provides contextual data.",
+    );
+
+    ctx.snippet_completion(
         "let binding",
         "let ${name} = ${value}",
         "Saves a value in a variable.",
@@ -995,7 +1030,7 @@ impl<'a> CompletionContext<'a> {
     ) -> Option<Self> {
         let text = source.text();
         let library = world.library();
-        let leaf = LinkedNode::new(source.root()).leaf_at(cursor)?;
+        let leaf = LinkedNode::new(source.root()).leaf_at(cursor, Side::Before)?;
         Some(Self {
             world,
             document,
@@ -1015,7 +1050,7 @@ impl<'a> CompletionContext<'a> {
 
     /// A small window of context before the cursor.
     fn before_window(&self, size: usize) -> &str {
-        &self.before[self.cursor.saturating_sub(size)..]
+        Scanner::new(self.before).from(self.cursor.saturating_sub(size))
     }
 
     /// Add a prefix and suffix to all applications.
@@ -1060,9 +1095,11 @@ impl<'a> CompletionContext<'a> {
     /// Add completions for all available packages.
     fn package_completions(&mut self, all_versions: bool) {
         let mut packages: Vec<_> = self.world.packages().iter().collect();
-        packages.sort_by_key(|(spec, _)| (&spec.name, Reverse(spec.version)));
+        packages.sort_by_key(|(spec, _)| {
+            (&spec.namespace, &spec.name, Reverse(spec.version))
+        });
         if !all_versions {
-            packages.dedup_by_key(|(spec, _)| &spec.name);
+            packages.dedup_by_key(|(spec, _)| (&spec.namespace, &spec.name));
         }
         for (package, description) in packages {
             self.value_completion(
@@ -1140,7 +1177,7 @@ impl<'a> CompletionContext<'a> {
         parens: bool,
         docs: Option<&str>,
     ) {
-        let at = label.as_deref().map_or(false, |field| !is_ident(field));
+        let at = label.as_deref().is_some_and(|field| !is_ident(field));
         let label = label.unwrap_or_else(|| value.repr());
 
         let detail = docs.map(Into::into).or_else(|| match value {
@@ -1189,7 +1226,7 @@ impl<'a> CompletionContext<'a> {
     /// Add completions for a castable.
     fn cast_completions(&mut self, cast: &'a CastInfo) {
         // Prevent duplicate completions from appearing.
-        if !self.seen_casts.insert(typst::util::hash128(cast)) {
+        if !self.seen_casts.insert(typst::utils::hash128(cast)) {
             return;
         }
 
@@ -1279,62 +1316,12 @@ impl<'a> CompletionContext<'a> {
     /// Filters the global/math scope with the given filter.
     fn scope_completions(&mut self, parens: bool, filter: impl Fn(&Value) -> bool) {
         let mut defined = BTreeSet::new();
-
-        let mut ancestor = Some(self.leaf.clone());
-        while let Some(node) = &ancestor {
-            let mut sibling = Some(node.clone());
-            while let Some(node) = &sibling {
-                if let Some(v) = node.cast::<ast::LetBinding>() {
-                    for ident in v.kind().bindings() {
-                        defined.insert(ident.get().clone());
-                    }
-                }
-
-                if let Some(v) = node.cast::<ast::ModuleImport>() {
-                    let imports = v.imports();
-                    match imports {
-                        None | Some(ast::Imports::Wildcard) => {
-                            if let Some(value) = node
-                                .children()
-                                .find(|child| child.is::<ast::Expr>())
-                                .and_then(|source| analyze_import(self.world, &source))
-                            {
-                                if imports.is_none() {
-                                    defined.extend(value.name().map(Into::into));
-                                } else if let Some(scope) = value.scope() {
-                                    for (name, _) in scope.iter() {
-                                        defined.insert(name.clone());
-                                    }
-                                }
-                            }
-                        }
-                        Some(ast::Imports::Items(items)) => {
-                            for item in items.iter() {
-                                defined.insert(item.bound_name().get().clone());
-                            }
-                        }
-                    }
-                }
-
-                sibling = node.prev_sibling();
+        named_items(self.world, self.leaf.clone(), |name| {
+            if name.value().as_ref().map_or(true, &filter) {
+                defined.insert(name.name().clone());
             }
-
-            if let Some(parent) = node.parent() {
-                if let Some(v) = parent.cast::<ast::ForLoop>() {
-                    if node.prev_sibling_kind() != Some(SyntaxKind::In) {
-                        let pattern = v.pattern();
-                        for ident in pattern.bindings() {
-                            defined.insert(ident.get().clone());
-                        }
-                    }
-                }
-
-                ancestor = Some(parent.clone());
-                continue;
-            }
-
-            break;
-        }
+            None::<()>
+        });
 
         let in_math = matches!(
             self.leaf.parent_kind(),
@@ -1345,7 +1332,7 @@ impl<'a> CompletionContext<'a> {
         );
 
         let scope = if in_math { self.math } else { self.global };
-        for (name, value) in scope.iter() {
+        for (name, value, _) in scope.iter() {
             if filter(value) && !defined.contains(name) {
                 self.value_completion(Some(name.clone()), value, parens, None);
             }
@@ -1361,5 +1348,59 @@ impl<'a> CompletionContext<'a> {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::autocomplete;
+    use crate::tests::TestWorld;
+
+    #[track_caller]
+    fn test(text: &str, cursor: usize, contains: &[&str], excludes: &[&str]) {
+        let world = TestWorld::new(text);
+        let doc = typst::compile(&world).output.ok();
+        let (_, completions) =
+            autocomplete(&world, doc.as_ref(), &world.main, cursor, true)
+                .unwrap_or_default();
+
+        let labels: Vec<_> = completions.iter().map(|c| c.label.as_str()).collect();
+        for item in contains {
+            assert!(labels.contains(item), "{item:?} was not contained in {labels:?}");
+        }
+        for item in excludes {
+            assert!(!labels.contains(item), "{item:?} was not excluded in {labels:?}");
+        }
+    }
+
+    #[test]
+    fn test_autocomplete() {
+        test("#i", 2, &["int", "if conditional"], &["foo"]);
+        test("#().", 4, &["insert", "remove", "len", "all"], &["foo"]);
+    }
+
+    #[test]
+    fn test_autocomplete_whitespace() {
+        //Check that extra space before '.' is handled correctly.
+        test("#() .", 5, &[], &["insert", "remove", "len", "all"]);
+        test("#{() .}", 6, &["insert", "remove", "len", "all"], &["foo"]);
+
+        test("#() .a", 6, &[], &["insert", "remove", "len", "all"]);
+        test("#{() .a}", 7, &["at", "any", "all"], &["foo"]);
+    }
+
+    #[test]
+    fn test_autocomplete_before_window_char_boundary() {
+        // Check that the `before_window` doesn't slice into invalid byte
+        // boundaries.
+        let s = "😀😀     #text(font: \"\")";
+        test(s, s.len() - 2, &[], &[]);
+    }
+
+    #[test]
+    fn test_autocomplete_mutable_method() {
+        let s = "#{ let x = (1, 2, 3); x. }";
+        test(s, s.len() - 2, &["at", "push", "pop"], &[]);
     }
 }

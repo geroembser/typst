@@ -6,7 +6,9 @@ use crate::foundations::{
     elem, Args, Cast, Construct, Content, NativeElement, Packed, Set, Smart, StyleChain,
     Unlabellable,
 };
+use crate::introspection::Locator;
 use crate::layout::{Em, Fragment, Length, Size};
+use crate::realize::StyleVec;
 
 /// Arranges text, spacing and inline-level elements into a paragraph.
 ///
@@ -16,9 +18,9 @@ use crate::layout::{Em, Fragment, Length, Size};
 ///
 /// # Example
 /// ```example
-/// #show par: set block(spacing: 0.65em)
 /// #set par(
 ///   first-line-indent: 1em,
+///   spacing: 0.65em,
 ///   justify: true,
 /// )
 ///
@@ -36,10 +38,37 @@ use crate::layout::{Em, Fragment, Length, Size};
 #[elem(title = "Paragraph", Debug, Construct)]
 pub struct ParElem {
     /// The spacing between lines.
+    ///
+    /// Leading defines the spacing between the [bottom edge]($text.bottom-edge)
+    /// of one line and the [top edge]($text.top-edge) of the following line. By
+    /// default, these two properties are up to the font, but they can also be
+    /// configured manually with a text set rule.
+    ///
+    /// By setting top edge, bottom edge, and leading, you can also configure a
+    /// consistent baseline-to-baseline distance. You could, for instance, set
+    /// the leading to `{1em}`, the top-edge to `{0.8em}`, and the bottom-edge
+    /// to `-{0.2em}` to get a baseline gap of exactly `{2em}`. The exact
+    /// distribution of the top- and bottom-edge values affects the bounds of
+    /// the first and last line.
     #[resolve]
     #[ghost]
     #[default(Em::new(0.65).into())]
     pub leading: Length,
+
+    /// The spacing between paragraphs.
+    ///
+    /// Just like leading, this defines the spacing between the bottom edge of a
+    /// paragraph's last line and the top edge of the next paragraph's first
+    /// line.
+    ///
+    /// When a paragraph is adjacent to a [`block`] that is not a paragraph,
+    /// that block's [`above`]($block.above) or [`below`]($block.below) property
+    /// takes precedence over the paragraph spacing. Headings, for instance,
+    /// reduce the spacing below them by default for a better look.
+    #[resolve]
+    #[ghost]
+    #[default(Em::new(1.2).into())]
+    pub spacing: Length,
 
     /// Whether to justify text in its line.
     ///
@@ -47,8 +76,8 @@ pub struct ParElem {
     /// [text function's `hyphenate` property]($text.hyphenate) is set to
     /// `{auto}` and the current language is known.
     ///
-    /// Note that the current [alignment]($align) still has an effect on the
-    /// placement of the last line except if it ends with a
+    /// Note that the current [alignment]($align.alignment) still has an effect
+    /// on the placement of the last line except if it ends with a
     /// [justified line break]($linebreak.justify).
     #[ghost]
     #[default(false)]
@@ -85,9 +114,8 @@ pub struct ParElem {
     ///
     /// By typographic convention, paragraph breaks are indicated either by some
     /// space between paragraphs or by indented first lines. Consider reducing
-    /// the [paragraph spacing]($block.spacing) to the [`leading`] when
-    /// using this property (e.g. using
-    /// `[#show par: set block(spacing: 0.65em)]`).
+    /// the [paragraph spacing]($block.spacing) to the [`leading`]($par.leading)
+    /// when using this property (e.g. using `[#set par(spacing: 0.65em)]`).
     #[ghost]
     pub first_line_indent: Length,
 
@@ -95,6 +123,15 @@ pub struct ParElem {
     #[ghost]
     #[resolve]
     pub hanging_indent: Length,
+
+    /// Indicates wheter an overflowing line should be shrunk.
+    ///
+    /// This property is set to `false` on raw blocks, because shrinking a line
+    /// could visually break the indentation.
+    #[ghost]
+    #[internal]
+    #[default(true)]
+    pub shrink: bool,
 
     /// The contents of the paragraph.
     #[external]
@@ -104,7 +141,7 @@ pub struct ParElem {
     /// The paragraph's children.
     #[internal]
     #[variadic]
-    pub children: Vec<Content>,
+    pub children: StyleVec,
 }
 
 impl Construct for ParElem {
@@ -128,14 +165,16 @@ impl Packed<ParElem> {
     pub fn layout(
         &self,
         engine: &mut Engine,
+        locator: Locator,
         styles: StyleChain,
         consecutive: bool,
         region: Size,
         expand: bool,
     ) -> SourceResult<Fragment> {
         crate::layout::layout_inline(
-            self.children(),
+            &self.children,
             engine,
+            locator,
             styles,
             consecutive,
             region,
@@ -147,7 +186,7 @@ impl Packed<ParElem> {
 impl Debug for ParElem {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "Par ")?;
-        f.debug_list().entries(&self.children).finish()
+        self.children.fmt(f)
     }
 }
 

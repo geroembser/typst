@@ -14,12 +14,12 @@ use crate::introspection::{
     Count, Counter, CounterKey, CounterUpdate, Locatable, Location,
 };
 use crate::layout::{
-    Alignment, BlockElem, Em, HAlignment, Length, OuterVAlignment, PlaceElem, VAlignment,
-    VElem,
+    AlignElem, Alignment, BlockChild, BlockElem, Em, HAlignment, Length, OuterVAlignment,
+    PlaceElem, VAlignment, VElem,
 };
 use crate::model::{Numbering, NumberingPattern, Outlinable, Refable, Supplement};
 use crate::text::{Lang, Region, TextElem};
-use crate::util::NonZeroExt;
+use crate::utils::NonZeroExt;
 use crate::visualize::ImageElem;
 
 /// A figure with an optional caption.
@@ -103,7 +103,7 @@ use crate::visualize::ImageElem;
 /// ```
 #[elem(scope, Locatable, Synthesize, Count, Show, ShowSet, Refable, Outlinable)]
 pub struct FigureElem {
-    /// The content of the figure. Often, an [image]($image).
+    /// The content of the figure. Often, an [image].
     #[required]
     pub body: Content,
 
@@ -143,12 +143,12 @@ pub struct FigureElem {
     /// If set to `{auto}`, the figure will try to automatically determine its
     /// kind based on the type of its body. Automatically detected kinds are
     /// [tables]($table) and [code]($raw). In other cases, the inferred kind is
-    /// that of an [image]($image).
+    /// that of an [image].
     ///
     /// Setting this to something other than `{auto}` will override the
     /// automatic detection. This can be useful if
     /// - you wish to create a custom figure type that is not an
-    ///   [image]($image), a [table]($table) or [code]($raw),
+    ///   [image], a [table] or [code]($raw),
     /// - you want to force the figure to use a specific counter regardless of
     ///   its content.
     ///
@@ -199,7 +199,7 @@ pub struct FigureElem {
     #[default(Em::new(0.65).into())]
     pub gap: Length,
 
-    /// Whether the figure should appear in an [`outline`]($outline) of figures.
+    /// Whether the figure should appear in an [`outline`] of figures.
     #[default(true)]
     pub outlined: bool,
 
@@ -274,7 +274,7 @@ impl Synthesize for Packed<FigureElem> {
                 };
 
                 let target = descendant.unwrap_or_else(|| Cow::Borrowed(elem.body()));
-                Some(supplement.resolve(engine, [target])?)
+                Some(supplement.resolve(engine, styles, [target])?)
             }
         };
 
@@ -318,10 +318,9 @@ impl Show for Packed<FigureElem> {
 
         // Wrap the contents in a block.
         realized = BlockElem::new()
-            .with_body(Some(realized))
+            .with_body(Some(BlockChild::Content(realized)))
             .pack()
-            .spanned(self.span())
-            .aligned(Alignment::CENTER);
+            .spanned(self.span());
 
         // Wrap in a float.
         if let Some(align) = self.placement(styles) {
@@ -340,7 +339,10 @@ impl ShowSet for Packed<FigureElem> {
     fn show_set(&self, _: StyleChain) -> Styles {
         // Still allows breakable figures with
         // `show figure: set block(breakable: true)`.
-        BlockElem::set_breakable(false).wrap().into()
+        let mut map = Styles::new();
+        map.set(BlockElem::set_breakable(false));
+        map.set(AlignElem::set_alignment(Alignment::CENTER));
+        map
     }
 }
 
@@ -377,7 +379,11 @@ impl Refable for Packed<FigureElem> {
 }
 
 impl Outlinable for Packed<FigureElem> {
-    fn outline(&self, engine: &mut Engine) -> SourceResult<Option<Content>> {
+    fn outline(
+        &self,
+        engine: &mut Engine,
+        styles: StyleChain,
+    ) -> SourceResult<Option<Content>> {
         if !self.outlined(StyleChain::default()) {
             return Ok(None);
         }
@@ -396,9 +402,12 @@ impl Outlinable for Packed<FigureElem> {
             (**self).counter(),
             self.numbering(),
         ) {
-            let numbers = counter
-                .at(engine, self.location().unwrap())?
-                .display(engine, numbering)?;
+            let numbers = counter.display_at_loc(
+                engine,
+                self.location().unwrap(),
+                styles,
+                numbering,
+            )?;
 
             if !supplement.is_empty() {
                 supplement += TextElem::packed('\u{a0}');
@@ -418,9 +427,9 @@ impl Outlinable for Packed<FigureElem> {
 /// specific kind.
 ///
 /// In addition to its `pos` and `body`, the `caption` also provides the
-/// figure's `kind`, `supplement`, `counter`, `numbering`, and `location` as
-/// fields. These parts can be used in [`where`]($function.where) selectors and
-/// show rules to build a completely custom caption.
+/// figure's `kind`, `supplement`, `counter`, and `numbering` as fields. These
+/// parts can be used in [`where`]($function.where) selectors and show rules to
+/// build a completely custom caption.
 ///
 /// ```example
 /// #show figure.caption: emph
@@ -430,7 +439,7 @@ impl Outlinable for Packed<FigureElem> {
 ///   caption: [A rectangle],
 /// )
 /// ```
-#[elem(name = "caption", Show)]
+#[elem(name = "caption", Synthesize, Show)]
 pub struct FigureCaption {
     /// The caption's position in the figure. Either `{top}` or `{bottom}`.
     ///
@@ -483,7 +492,8 @@ pub struct FigureCaption {
     /// ```example
     /// #show figure.caption: it => [
     ///   #underline(it.body) |
-    ///   #it.supplement #it.counter.display(it.numbering)
+    ///   #it.supplement
+    ///   #context it.counter.display(it.numbering)
     /// ]
     ///
     /// #figure(
@@ -538,6 +548,14 @@ impl FigureCaption {
     }
 }
 
+impl Synthesize for Packed<FigureCaption> {
+    fn synthesize(&mut self, _: &mut Engine, styles: StyleChain) -> SourceResult<()> {
+        let elem = self.as_mut();
+        elem.push_separator(Smart::Custom(elem.get_separator(styles)));
+        Ok(())
+    }
+}
+
 impl Show for Packed<FigureCaption> {
     #[typst_macros::time(name = "figure.caption", span = self.span())]
     fn show(&self, engine: &mut Engine, styles: StyleChain) -> SourceResult<Content> {
@@ -554,7 +572,7 @@ impl Show for Packed<FigureCaption> {
             self.counter(),
             self.figure_location(),
         ) {
-            let numbers = counter.at(engine, *location)?.display(engine, numbering)?;
+            let numbers = counter.display_at_loc(engine, *location, styles, numbering)?;
             if !supplement.is_empty() {
                 supplement += TextElem::packed('\u{a0}');
             }

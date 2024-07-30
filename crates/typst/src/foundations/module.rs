@@ -5,12 +5,16 @@ use ecow::{eco_format, EcoString};
 
 use crate::diag::StrResult;
 use crate::foundations::{repr, ty, Content, Scope, Value};
+use crate::syntax::FileId;
 
 /// An evaluated module, either built-in or resulting from a file.
 ///
 /// You can access definitions from the module using
 /// [field access notation]($scripting/#fields) and interact with it using the
-/// [import and include syntaxes]($scripting/#modules).
+/// [import and include syntaxes]($scripting/#modules). Alternatively, it is
+/// possible to convert a module to a dictionary, and therefore access its
+/// contents dynamically, using the
+/// [dictionary constructor]($dictionary/#constructor).
 ///
 /// # Example
 /// ```example
@@ -40,6 +44,8 @@ struct Repr {
     scope: Scope,
     /// The module's layoutable contents.
     content: Content,
+    /// The id of the file which defines the module, if any.
+    file_id: Option<FileId>,
 }
 
 impl Module {
@@ -47,7 +53,7 @@ impl Module {
     pub fn new(name: impl Into<EcoString>, scope: Scope) -> Self {
         Self {
             name: name.into(),
-            inner: Arc::new(Repr { scope, content: Content::empty() }),
+            inner: Arc::new(Repr { scope, content: Content::empty(), file_id: None }),
         }
     }
 
@@ -69,6 +75,12 @@ impl Module {
         self
     }
 
+    /// Update the module's file id.
+    pub fn with_file_id(mut self, file_id: FileId) -> Self {
+        Arc::make_mut(&mut self.inner).file_id = Some(file_id);
+        self
+    }
+
     /// Get the module's name.
     pub fn name(&self) -> &EcoString {
         &self.name
@@ -77,6 +89,13 @@ impl Module {
     /// Access the module's scope.
     pub fn scope(&self) -> &Scope {
         &self.inner.scope
+    }
+
+    /// Access the module's file id.
+    ///
+    /// Some modules are not associated with a file, like the built-in modules.
+    pub fn file_id(&self) -> Option<FileId> {
+        self.inner.file_id
     }
 
     /// Access the module's scope, mutably.

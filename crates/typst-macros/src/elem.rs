@@ -18,14 +18,23 @@ pub fn elem(stream: TokenStream, body: syn::ItemStruct) -> Result<TokenStream> {
 
 /// Details about an element.
 struct Elem {
+    /// The element's name as exposed to Typst.
     name: String,
+    /// The element's title case name.
     title: String,
+    /// Whether this element has an associated scope defined by the `#[scope]` macro.
     scope: bool,
+    /// A list of alternate search terms for this element.
     keywords: Vec<String>,
+    /// The documentation for this element as a string.
     docs: String,
+    /// The element's visibility.
     vis: syn::Visibility,
+    /// The struct name for this element given in Rust.
     ident: Ident,
+    /// The list of capabilities for this element.
     capabilities: Vec<Ident>,
+    /// The fields of this element.
     fields: Vec<Field>,
 }
 
@@ -97,30 +106,59 @@ impl Elem {
     }
 }
 
+/// A field of an [element definition][`Elem`].
 struct Field {
+    /// The name of this field.
     ident: Ident,
+    /// The identifier `{ident}_in`.
     ident_in: Ident,
+    /// The identifier `with_{ident}`.
     with_ident: Ident,
+    /// The identifier `push_{ident}`.
     push_ident: Ident,
+    /// The identifier `set_{ident}`.
     set_ident: Ident,
+    /// The upper camel-case version of `ident`, used for the enum variant name.
     enum_ident: Ident,
+    /// The all-caps snake-case version of `ident`, used for the constant name.
     const_ident: Ident,
+    /// The visibility of this field.
     vis: syn::Visibility,
+    /// The type of this field.
     ty: syn::Type,
+    /// The type returned by accessor methods for this field.
+    ///
+    /// Usually, this is the same as `ty`, but this might be different
+    /// if this field has a `#[resolve]` attribute.
     output: syn::Type,
+    /// The field's identifier as exposed to Typst.
     name: String,
+    /// The documentation for this field as a string.
     docs: String,
+    /// Whether this field is positional (as opposed to named).
     positional: bool,
+    /// Whether this field is required.
     required: bool,
+    /// Whether this field is variadic; that is, has its values
+    /// taken from a variable number of arguments.
     variadic: bool,
+    /// Whether this field has a `#[resolve]` attribute.
     resolve: bool,
+    /// Whether this field has a `#[fold]` attribute.
     fold: bool,
+    /// Whether this field is excluded from documentation.
     internal: bool,
+    /// Whether this field exists only in documentation.
     external: bool,
+    /// Whether this field has a `#[borrowed]` attribute.
     borrowed: bool,
+    /// Whether this field has a `#[ghost]` attribute.
     ghost: bool,
+    /// Whether this field has a `#[synthesized]` attribute.
     synthesized: bool,
+    /// The contents of the `#[parse({..})]` attribute, if any.
     parse: Option<BlockWithReturn>,
+    /// The contents of the `#[default(..)]` attribute, if any.
     default: Option<syn::Expr>,
 }
 
@@ -311,6 +349,7 @@ fn create_struct(element: &Elem) -> TokenStream {
         #[doc = #docs]
         #[derive(#debug Clone, Hash)]
         #[allow(clippy::derived_hash_with_manual_eq)]
+        #[allow(rustdoc::broken_intra_doc_links)]
         #vis struct #ident {
             #(#fields,)*
         }
@@ -351,13 +390,13 @@ fn create_fields_enum(element: &Elem) -> TokenStream {
         }
 
         impl ::std::convert::TryFrom<u8> for Fields {
-            type Error = ();
+            type Error = #foundations::FieldAccessError;
 
             fn try_from(value: u8) -> Result<Self, Self::Error> {
                 #(const #consts: u8 = Fields::#variants as u8;)*
                 match value {
                     #(#consts => Ok(Self::#variants),)*
-                    _ => Err(()),
+                    _ => Err(#foundations::FieldAccessError::Internal),
                 }
             }
         }
@@ -617,6 +656,7 @@ fn create_native_elem_impl(element: &Elem) -> TokenStream {
             vtable:  <#ident as #foundations::Capable>::vtable,
             field_id: |name| name.parse().ok().map(|id: Fields| id as u8),
             field_name: |id| id.try_into().ok().map(Fields::to_str),
+            field_from_styles: <#ident as #foundations::Fields>::field_from_styles,
             local_name: #local_name,
             scope: #foundations::Lazy::new(|| #scope),
             params: #foundations::Lazy::new(|| ::std::vec![#(#params),*])
@@ -797,7 +837,7 @@ fn create_capable_impl(element: &Elem) -> TokenStream {
                 // Safety: The vtable function doesn't require initialized
                 // data, so it's fine to use a dangling pointer.
                 return Some(unsafe {
-                    ::typst::util::fat::vtable(dangling as *const dyn #capability)
+                    ::typst::utils::fat::vtable(dangling as *const dyn #capability)
                 });
             }
         }
@@ -805,7 +845,7 @@ fn create_capable_impl(element: &Elem) -> TokenStream {
 
     quote! {
         unsafe impl #foundations::Capable for #ident {
-            fn vtable(capability: ::std::any::TypeId) -> ::std::option::Option<*const ()> {
+            fn vtable(capability: ::std::any::TypeId) -> ::std::option::Option<::std::ptr::NonNull<()>> {
                 let dangling = ::std::ptr::NonNull::<#foundations::Packed<#ident>>::dangling().as_ptr();
                 #(#checks)*
                 None
@@ -837,9 +877,9 @@ fn create_fields_impl(element: &Elem) -> TokenStream {
         let Field { enum_ident, ident, .. } = field;
 
         let expr = if field.required {
-            quote! { Some(#into_value(self.#ident.clone())) }
+            quote! { Ok(#into_value(self.#ident.clone())) }
         } else {
-            quote! { self.#ident.clone().map(#into_value) }
+            quote! { self.#ident.clone().map(#into_value).ok_or(#foundations::FieldAccessError::Unset) }
         };
 
         quote! { Fields::#enum_ident => #expr }
@@ -850,9 +890,9 @@ fn create_fields_impl(element: &Elem) -> TokenStream {
         let Field { enum_ident, ident, .. } = field;
 
         let expr = if field.required {
-            quote! { Some(#into_value(self.#ident.clone())) }
+            quote! { Ok(#into_value(self.#ident.clone())) }
         } else if field.synthesized {
-            quote! { self.#ident.clone().map(#into_value) }
+            quote! { self.#ident.clone().map(#into_value).ok_or(#foundations::FieldAccessError::Unset) }
         } else {
             let value = create_style_chain_access(
                 field,
@@ -860,7 +900,21 @@ fn create_fields_impl(element: &Elem) -> TokenStream {
                 if field.ghost { quote!(None) } else { quote!(self.#ident.as_ref()) },
             );
 
-            quote! { Some(#into_value(#value)) }
+            quote! { Ok(#into_value(#value)) }
+        };
+
+        quote! { Fields::#enum_ident => #expr }
+    });
+
+    // Fields that can be accessed using the `field_from_styles` method.
+    let field_from_styles_arms = element.visible_fields().map(|field| {
+        let Field { enum_ident, .. } = field;
+
+        let expr = if field.required || field.synthesized {
+            quote! { Err(#foundations::FieldAccessError::Unknown) }
+        } else {
+            let value = create_style_chain_access(field, false, quote!(None));
+            quote! { Ok(#into_value(#value)) }
         };
 
         quote! { Fields::#enum_ident => #expr }
@@ -908,6 +962,10 @@ fn create_fields_impl(element: &Elem) -> TokenStream {
 
     let Elem { ident, .. } = element;
 
+    let result = quote! {
+        Result<#foundations::Value, #foundations::FieldAccessError>
+    };
+
     quote! {
         impl #foundations::Fields for #ident {
             type Enum = Fields;
@@ -923,19 +981,33 @@ fn create_fields_impl(element: &Elem) -> TokenStream {
                 }
             }
 
-            fn field(&self, id: u8) -> Option<#foundations::Value> {
-                let id = Fields::try_from(id).ok()?;
+            fn field(&self, id: u8) -> #result {
+                let id = Fields::try_from(id)?;
                 match id {
                     #(#field_arms,)*
-                    _ => None,
+                    // This arm might be reached if someone tries to access an
+                    // internal field.
+                    _ => Err(#foundations::FieldAccessError::Unknown),
                 }
             }
 
-            fn field_with_styles(&self, id: u8, styles: #foundations::StyleChain) -> Option<#foundations::Value> {
-                let id = Fields::try_from(id).ok()?;
+            fn field_with_styles(&self, id: u8, styles: #foundations::StyleChain) -> #result {
+                let id = Fields::try_from(id)?;
                 match id {
                     #(#field_with_styles_arms,)*
-                    _ => None,
+                    // This arm might be reached if someone tries to access an
+                    // internal field.
+                    _ => Err(#foundations::FieldAccessError::Unknown),
+                }
+            }
+
+            fn field_from_styles(id: u8, styles: #foundations::StyleChain) -> #result {
+                let id = Fields::try_from(id)?;
+                match id {
+                    #(#field_from_styles_arms,)*
+                    // This arm might be reached if someone tries to access an
+                    // internal field.
+                    _ => Err(#foundations::FieldAccessError::Unknown),
                 }
             }
 
